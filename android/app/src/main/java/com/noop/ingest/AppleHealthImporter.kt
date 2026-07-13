@@ -277,8 +277,7 @@ object AppleHealthImporter {
         }
 
         val valueForKey = rawValue ?: numeric?.toString() ?: ""
-        val key = dedupeKey(type, start.epoch, end.epoch, source, valueForKey)
-        if (!agg.markSeen(key)) return
+        if (!agg.markSeen(type, start.epoch, end.epoch, source, valueForKey)) return
 
         if (numeric == null) return
         agg.addSample(type, numeric, unit, start, end, start.offsetMin, source)
@@ -518,10 +517,6 @@ object AppleHealthImporter {
         for (p in PREFIXES) if (raw.startsWith(p)) return raw.substring(p.length)
         return raw
     }
-
-    /** Dedupe key per spec: `type|start|end|source|value` (epoch seconds as Double, like Swift). */
-    private fun dedupeKey(type: String, start: Double, end: Double, source: String?, value: String): String =
-        "$type|$start|$end|${source ?: ""}|$value"
 }
 
 /**
@@ -707,7 +702,7 @@ private class Aggregator {
     }
 
     private val byDay = HashMap<String, DayAcc>()
-    private val seen = HashSet<String>()
+    private val seen = LongPairSet()
     private val workouts = ArrayList<PendingWorkout>()
 
     /** True once any relevant, date-valid record / workout / sleep row was dispatched. Drives the
@@ -726,8 +721,37 @@ private class Aggregator {
         val energyKcal: Double?,
     )
 
-    /** Returns true if [key] was not seen before (i.e. this row should be processed). */
-    fun markSeen(key: String): Boolean = seen.add(key)
+    /**
+     * Returns true if this `type|start|end|source|value` row was not seen before (i.e. it should be
+     * processed). Instead of retaining the concatenated dedupe String per record — multiple GB of heap
+     * across the tens of millions of records in a multi-year export — we fold the same five components
+     * into a 128-bit fingerprint (two independent 64-bit mixes) and store only that in [seen]. The
+     * String is never materialised; `start`/`end` fold their raw bits, matching the epoch-Double key.
+     */
+    fun markSeen(type: String, start: Double, end: Double, source: String?, value: String): Boolean {
+        var h1 = FP_SEED_A
+        var h2 = FP_SEED_B
+        h1 = foldStr(h1, type, FP_MUL_A); h2 = foldStr(h2, type, FP_MUL_B)
+        h1 = fpMix(h1, java.lang.Double.doubleToLongBits(start), FP_MUL_A)
+        h2 = fpMix(h2, java.lang.Double.doubleToLongBits(start), FP_MUL_B)
+        h1 = fpMix(h1, java.lang.Double.doubleToLongBits(end), FP_MUL_A)
+        h2 = fpMix(h2, java.lang.Double.doubleToLongBits(end), FP_MUL_B)
+        h1 = foldStr(h1, source ?: "", FP_MUL_A); h2 = foldStr(h2, source ?: "", FP_MUL_B)
+        h1 = foldStr(h1, value, FP_MUL_A); h2 = foldStr(h2, value, FP_MUL_B)
+        return seen.add(h1, h2)
+    }
+
+    private fun foldStr(h0: Long, s: String, mul: Long): Long {
+        var h = h0
+        for (i in s.indices) h = fpMix(h, s[i].code.toLong(), mul)
+        // Fold the length as a field boundary so distinct component splits cannot collide.
+        return fpMix(h, s.length.toLong(), mul)
+    }
+
+    private fun fpMix(h: Long, x: Long, mul: Long): Long {
+        val v = (h xor x) * mul
+        return v xor (v ushr 29)
+    }
 
     fun hasAnyRecord(): Boolean = sawAnyRecord
 
@@ -870,6 +894,13 @@ private class Aggregator {
     }
 
     companion object {
+        // Two independent multiplicative-mix folds (distinct seeds + odd multipliers) produce the two
+        // halves of the 128-bit dedupe fingerprint. See markSeen.
+        private const val FP_SEED_A = -0x61c8864680b583ebL // 0x9E3779B97F4A7C15 (golden ratio)
+        private const val FP_SEED_B = -0x340d631b7bdddcdbL // 0xCBF29CE484222325 (FNV offset basis)
+        private const val FP_MUL_A = -0x61c8864680b583ebL  // 0x9E3779B97F4A7C15
+        private const val FP_MUL_B = 0x100000001b3L        // 0x100000001B3 (FNV prime, odd)
+
         /** Inverse of HealthDate.daysFromCivil — days since epoch -> `yyyy-MM-dd` (UTC civil). */
         fun civilFromDays(z0: Long): String {
             val z = z0 + 719468L
@@ -884,6 +915,88 @@ private class Aggregator {
             val year = (if (m <= 2) y + 1 else y).toInt()
             return String.format("%04d-%02d-%02d", year, m, d)
         }
+    }
+}
+
+/**
+ * Open-addressed set of 128-bit fingerprints, stored as (hi, lo) `Long` pairs interleaved in a single
+ * [LongArray] with linear probing and a power-of-two capacity. Replaces a `HashSet<String>` of
+ * concatenated dedupe keys: per distinct record it costs ~16 bytes of primitive storage and zero
+ * allocation, instead of retaining a 50–90 char String — so heap scales with distinct records without
+ * String/boxing garbage, and a decade-deep export no longer OOMs. The all-zero pair is the empty-slot
+ * sentinel; a genuine (0,0) fingerprint is tracked separately via [hasZero].
+ */
+private class LongPairSet(initialCapacity: Int = 1 shl 16) {
+    private var slots: LongArray            // [hi0, lo0, hi1, lo1, ...]
+    private var mask: Int                   // capacity(in pairs) - 1
+    private var size = 0
+    private var hasZero = false
+
+    init {
+        var cap = 1
+        while (cap < initialCapacity) cap = cap shl 1
+        slots = LongArray(cap * 2)
+        mask = cap - 1
+    }
+
+    /** Insert [hi]/[lo]; return true iff the fingerprint was not already present. */
+    fun add(hi: Long, lo: Long): Boolean {
+        if (hi == 0L && lo == 0L) {
+            if (hasZero) return false
+            hasZero = true
+            return true
+        }
+        // Grow before the table passes a 0.5 load factor so probe chains stay short.
+        if ((size + 1) * 2 > mask + 1) grow()
+        var idx = spread(hi) and mask
+        while (true) {
+            val p = idx * 2
+            val sh = slots[p]
+            val sl = slots[p + 1]
+            if (sh == 0L && sl == 0L) {
+                slots[p] = hi; slots[p + 1] = lo
+                size += 1
+                return true
+            }
+            if (sh == hi && sl == lo) return false
+            idx = (idx + 1) and mask
+        }
+    }
+
+    private fun grow() {
+        val old = slots
+        val newPairs = (mask + 1) shl 1
+        slots = LongArray(newPairs * 2)
+        mask = newPairs - 1
+        size = 0
+        var i = 0
+        while (i < old.size) {
+            val h = old[i]; val l = old[i + 1]
+            if (h != 0L || l != 0L) reinsert(h, l)
+            i += 2
+        }
+    }
+
+    private fun reinsert(hi: Long, lo: Long) {
+        var idx = spread(hi) and mask
+        while (true) {
+            val p = idx * 2
+            if (slots[p] == 0L && slots[p + 1] == 0L) {
+                slots[p] = hi; slots[p + 1] = lo
+                size += 1
+                return
+            }
+            idx = (idx + 1) and mask
+        }
+    }
+
+    /** Finalizer mix so the low bits used for the slot index are well distributed. */
+    private fun spread(z: Long): Int {
+        var v = z
+        v = (v xor (v ushr 33)) * 0xff51afd7ed558ccduL.toLong()
+        v = (v xor (v ushr 33)) * 0xc4ceb9fe1a85ec53uL.toLong()
+        v = v xor (v ushr 33)
+        return v.toInt()
     }
 }
 
@@ -944,6 +1057,8 @@ internal class SanitizingInputStream(
 
     /** Bytes lifted from the source but not yet sanitized — only an incomplete UTF-8 tail (≤ 3). */
     private var carry = ByteArray(0)
+    /** Reused source-read buffer — one allocation for the whole stream, not one per [refill]. */
+    private val chunkBuffer = ByteArray(chunkSize)
     /** Sanitized bytes ready to hand to the parser but not yet consumed. */
     private var out = ByteArray(0)
     private var outOffset = 0
@@ -1002,13 +1117,18 @@ internal class SanitizingInputStream(
 
     /** Read one chunk from the source, append to carry, scrub up to the last complete UTF-8 boundary. */
     private fun refill() {
-        val chunk = ByteArray(chunkSize)
-        val n = `in`.read(chunk, 0, chunkSize)
+        val n = `in`.read(chunkBuffer, 0, chunkSize)
         if (n <= 0) {
             sourceEof = true
             return
         }
-        carry = if (carry.isEmpty()) chunk.copyOf(n) else carry + chunk.copyOf(n)
+        // Splice the ≤ 3-byte carried UTF-8 tail in front of the freshly read bytes with one copy,
+        // instead of allocating `chunk.copyOf(n)` and concatenating it onto `carry`.
+        val carryLen = carry.size
+        val combined = ByteArray(carryLen + n)
+        System.arraycopy(carry, 0, combined, 0, carryLen)
+        System.arraycopy(chunkBuffer, 0, combined, carryLen, n)
+        carry = combined
         scrub(holdIncompleteTail = true)
     }
 
@@ -1020,9 +1140,13 @@ internal class SanitizingInputStream(
     private fun scrub(holdIncompleteTail: Boolean) {
         val bytes = carry
         val count = bytes.size
-        val sink = ArrayList<Byte>(count + (out.size - outOffset))
+        val carried = out.size - outOffset
+        // Sink straight into a ByteArray with a write index — no per-byte boxing or unbox copy.
+        // Worst case is one 3-byte U+FFFD replacement per input byte, so this size never overflows.
+        val sink = ByteArray(carried + 3 * count)
         // Keep any not-yet-consumed sanitized output ahead of the new bytes.
-        for (j in outOffset until out.size) sink.add(out[j])
+        System.arraycopy(out, outOffset, sink, 0, carried)
+        var w = carried
 
         var i = 0
         while (i < count) {
@@ -1031,7 +1155,7 @@ internal class SanitizingInputStream(
             // 1) ASCII fast path.
             if (b < 0x80) {
                 if (b >= 0x20 || b == 0x09 || b == 0x0A || b == 0x0D) {
-                    sink.add(b.toByte())
+                    sink[w] = b.toByte(); w += 1
                     inScrubRun = false
                 } else {
                     // XML-1.0-illegal C0 control char (< 0x20, not TAB/LF/CR) → drop.
@@ -1050,7 +1174,7 @@ internal class SanitizingInputStream(
             }
 
             if (seqLen == 0) {
-                emitReplacement(sink)
+                w = emitReplacement(sink, w)
                 i += 1
                 continue
             }
@@ -1060,19 +1184,19 @@ internal class SanitizingInputStream(
                     // Might still complete in the next chunk — carry it over.
                     break
                 } else {
-                    emitReplacement(sink)
+                    w = emitReplacement(sink, w)
                     i += 1
                     continue
                 }
             }
 
             if (isValidUtf8Sequence(bytes, i, seqLen)) {
-                for (k in 0 until seqLen) sink.add(bytes[i + k])
+                for (k in 0 until seqLen) { sink[w] = bytes[i + k]; w += 1 }
                 inScrubRun = false
                 i += seqLen
             } else {
                 // Only the lead byte is consumed; invalid continuation bytes are re-examined.
-                emitReplacement(sink)
+                w = emitReplacement(sink, w)
                 i += 1
             }
         }
@@ -1080,15 +1204,16 @@ internal class SanitizingInputStream(
         // Anything from i onward is the held-back incomplete tail (or nothing).
         carry = if (i >= count) ByteArray(0) else bytes.copyOfRange(i, count)
 
-        out = ByteArray(sink.size)
-        for (k in sink.indices) out[k] = sink[k]
+        // Trim to the bytes actually written (worst-case sizing over-allocates when little is scrubbed).
+        out = if (w == sink.size) sink else sink.copyOf(w)
         outOffset = 0
     }
 
-    private fun emitReplacement(sink: ArrayList<Byte>) {
+    private fun emitReplacement(sink: ByteArray, w: Int): Int {
         // U+FFFD in UTF-8.
-        sink.add(0xEF.toByte()); sink.add(0xBF.toByte()); sink.add(0xBD.toByte())
+        sink[w] = 0xEF.toByte(); sink[w + 1] = 0xBF.toByte(); sink[w + 2] = 0xBD.toByte()
         noteScrub()
+        return w + 3
     }
 
     /** Account for one scrubbed byte, collapsing consecutive bad bytes into a single counted span. */

@@ -616,15 +616,33 @@ class OuraLiveSource(
         // the mapping's per-batch constant anchor `{ batch.ts }` matches the Swift twin's
         // `OuraStreamMapping.streams(from: entry.events, at: entry.ts)`. Routing through the mapping (not
         // hand-built rows) is what keeps the production persist parity with Swift and under test.
+        //
+        // The per-batch mapping/toBatch calls stay (their per-batch ts-anchor semantics are what the unit
+        // tests + Swift parity pin), but their outputs are MERGED into one StreamBatch so a flush issues a
+        // SINGLE persist (one repository.insert / one Room transaction) instead of one per event. A history
+        // fetch that drains thousands of banked records otherwise pays a mapping pass + insert per record;
+        // rows already carry their own per-row timestamps, so concatenating batch outputs is order-safe and,
+        // with inserts idempotent by natural key, behaviourally identical to the old per-batch persist.
+        var merged = StreamBatch()
         for (batch in snapshot) {
             val streams = OuraStreamMapping.streams(batch.events) { batch.ts }
             val out = StreamPersistence.toBatch(streams)
-            if (out.hr.isNotEmpty() || out.rr.isNotEmpty() || out.spo2.isNotEmpty() ||
-                out.skinTemp.isNotEmpty() || out.events.isNotEmpty() || out.battery.isNotEmpty()
-            ) {
-                persist(out, deviceId)
-            }
+            merged = merged.copy(
+                hr = merged.hr + out.hr,
+                rr = merged.rr + out.rr,
+                events = merged.events + out.events,
+                battery = merged.battery + out.battery,
+                spo2 = merged.spo2 + out.spo2,
+                skinTemp = merged.skinTemp + out.skinTemp,
+                resp = merged.resp + out.resp,
+                gravity = merged.gravity + out.gravity,
+                steps = merged.steps + out.steps,
+                sleepState = merged.sleepState + out.sleepState,
+                ppgHr = merged.ppgHr + out.ppgHr,
+                droppedImplausibleTs = merged.droppedImplausibleTs + out.droppedImplausibleTs,
+            )
         }
+        if (!merged.isEmpty) persist(merged, deviceId)
     }
 
     /**

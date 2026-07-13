@@ -33,6 +33,11 @@ final class WatchSessionBridge: NSObject, ObservableObject {
     /// (~50/day for complication updates), so `pushLatest` never sends more often than this, and only
     /// when the headline values actually changed. BOTH checks must pass; see `shouldPush`.
     static let minPushInterval: TimeInterval = 30 * 60
+    /// The spacing floor used INSTEAD of `minPushInterval` when the watch is reachable. A reachable push
+    /// also rides the sendMessage fast-path in `send`, which does not draw on the complication budget, so
+    /// a genuinely changed snapshot is worth delivering promptly. This short floor only guards against a
+    /// pathological refresh loop hammering the link; the substance (headline-changed) gate still applies.
+    static let reachableMinPushInterval: TimeInterval = 30
     /// Whether a watch is currently paired + has the NOOP watch app installed + is reachable enough to
     /// receive context. Application context still queues for delivery when the watch is briefly away, so
     /// this is informational, not a gate on sending.
@@ -101,8 +106,14 @@ final class WatchSessionBridge: NSObject, ObservableObject {
     /// pushed this process, passes). (2) Substance: the snapshot's HEADLINE values differ from the last
     /// pushed one, so an unchanged dashboard never burns a transfer re-stating the same scores.
     private func shouldPush(_ snap: WatchScoreSnapshot, now: Date) -> Bool {
-        if let at = lastPushedAt, now.timeIntervalSince(at) < Self.minPushInterval { return false }
-        return Self.headlineChanged(from: lastSent, to: snap)
+        // Substance gate always applies: an unchanged dashboard never burns a transfer re-stating scores.
+        guard Self.headlineChanged(from: lastSent, to: snap) else { return false }
+        // Spacing gate: relaxed to a short floor while the watch is reachable (a changed snapshot then
+        // reaches the wrist over the fast-path, off the complication budget), and unchanged at 30 min when
+        // the watch is unreachable so background/context transfers still respect the system budget.
+        let spacing = (session?.isReachable ?? false) ? Self.reachableMinPushInterval : Self.minPushInterval
+        if let at = lastPushedAt, now.timeIntervalSince(at) < spacing { return false }
+        return true
     }
 
     /// Whether the headline content of `next` differs from the last-pushed snapshot. Headline = the
@@ -221,6 +232,13 @@ final class WatchSessionBridge: NSObject, ObservableObject {
             // updateApplicationContext replaces any previous context, so the watch always gets exactly
             // the latest snapshot and never a queued backlog.
             try session.updateApplicationContext([Self.contextKey: data])
+            // Reachable fast-path: when the watch is on the wrist + reachable, ALSO hand it the snapshot
+            // immediately via sendMessage so the glance updates now instead of on the context-delivery
+            // cadence. Fire-and-forget — updateApplicationContext above stays the reliable latest-state
+            // channel, so a failed live message is safe to ignore.
+            if session.isReachable {
+                session.sendMessage([Self.contextKey: data], replyHandler: nil, errorHandler: { _ in })
+            }
         } catch {
             // A failed context update is non-fatal: the app-group mirror above still carries the latest
             // value, and the next dashboard refresh will try again.

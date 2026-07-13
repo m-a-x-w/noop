@@ -259,8 +259,10 @@ fun TodayScreen(
     // needs a handful of stable, slow-changing fields, and the live HR matters here only as "is a stream
     // present" (null↔non-null), never the bpm number. Funnel those through a `derivedStateOf` snapshot so a
     // 72→73 bpm tick produces an EQUAL snapshot and the body is NOT recomposed; it only recomposes when
-    // connection / sync / battery / streaming-presence actually change. The live bpm number is rendered
-    // elsewhere (HeartRateTrendCard), which scopes its own collection. Appearance-preserving.
+    // connection / sync / battery / streaming-presence actually change. The Today tree never renders the
+    // live bpm number itself (only presence); the trend card below plots the banked HR curve and scopes
+    // its own `live` collection for the sync tokens through the same derivedStateOf trick.
+    // Appearance-preserving.
     val liveSnap by remember {
         derivedStateOf {
             val s = live
@@ -697,12 +699,31 @@ fun TodayScreen(
     // merges imported + computed sleep_performance (imported-wins), so an importer sees the export's
     // figure and a Bluetooth-only user sees the on-device composite. Null until loaded / no night yet.
     var restScoreForDay by remember { mutableStateOf<Double?>(null) }
-    LaunchedEffect(days, selectedDayKey, selectedDayOffset) {
-        val byDay = runCatching {
+    // The Rest tile's SPARKLINE series (#614 follow-up). The Rest tile's NUMBER is the Rest composite
+    // (0–100) from `sleep_performance`, but its mini-graph used to plot raw sleep MINUTES (`w.sleepMin`),
+    // so the trend line didn't track the score it sat under. Build the SAME 0–100 `sleep_performance`
+    // series, windowed to the trailing 14 calendar days ending on the selected day (oldest → newest, nulls
+    // dropped, mirrors remember14's windowing of the DailyMetric series). Now the sparkline tracks the
+    // Rest score. Empty until loaded.
+    var restCompositeSpark by remember { mutableStateOf<List<Double>>(emptyList()) }
+    // Provenance (COMPONENT 4) for the SLEEP ring: the RAW source id the resolver picked for the selected
+    // day (e.g. "my-whoop", "my-whoop-noop", "apple-health"). resolvedSeries applies the SAME imported-WHOOP
+    // > NOOP-computed > Apple-Health precedence the dashboard merge uses field-by-field
+    // (WhoopRepository.mergeDaily); the winner is the last resolved point on selectedDayKey. Mirrors the
+    // Swift Today lane's `provenanceByMetric` resolution. (Recovery's winner is resolved separately below.)
+    var provenanceSleep by remember { mutableStateOf<String?>(null) }
+    // PERF: the Rest score, the Rest sparkline, and the sleep provenance winner all derive from the SAME
+    // full-history `sleep_performance` resolution, which applies the multi-source merge precedence over
+    // every stored day. This used to be THREE separate LaunchedEffects (one identical query each) so a
+    // single `days`/day-selector change fired three full-history merge passes. Resolve it ONCE here and
+    // derive all three. The full history (not a bounded range) is required: freshRestScore's #977 stale-
+    // tail fallback needs the latest scored night ANYWHERE in history (byDay.maxByOrNull below).
+    LaunchedEffect(days, selectedDay, selectedDayKey, selectedDayOffset) {
+        val resolution = runCatching {
             viewModel.repo.resolvedSeries("sleep_performance", "my-whoop", "0000-00-00", "9999-99-99")
-                .values.associate { it.first to it.second }
-        }.getOrDefault(emptyMap())
-        // #977: the tail-fallback (latest scored night) is now freshness-gated. A live 5.0 whose sleep never
+        }.getOrNull()
+        val byDay = resolution?.values?.associate { it.first to it.second } ?: emptyMap()
+        // #977: the tail-fallback (latest scored night) is freshness-gated. A live 5.0 whose sleep never
         // scores used to pin Rest to the weeks-old series tail forever while Charge advanced; if that tail is
         // stale, fall through to null so the Rest ring shows its needs-a-tracked-night state instead of a
         // frozen number. `selectedDayKey` is today's key at offset 0, so it anchors the freshness check.
@@ -710,46 +731,32 @@ fun TodayScreen(
         restScoreForDay = freshRestScore(
             todayValue = byDay[selectedDayKey], lastDay = latest?.key, lastValue = latest?.value,
             isTodaySelected = selectedDayOffset == 0, today = selectedDayKey)
-    }
-
-    // The Rest tile's SPARKLINE series (#614 follow-up). The Rest tile's NUMBER is the Rest composite
-    // (0–100) from `sleep_performance` above, but its mini-graph used to plot raw sleep MINUTES
-    // (`w.sleepMin`), so the trend line didn't track the score it sat under. Build the SAME 0–100
-    // `sleep_performance` series here, windowed to the trailing 14 calendar days ending on the selected
-    // day (oldest → newest, nulls dropped, mirrors remember14's windowing of the DailyMetric series), and
-    // feed it to the Rest tile instead. Now the sparkline tracks the Rest score. Empty until loaded.
-    var restCompositeSpark by remember { mutableStateOf<List<Double>>(emptyList()) }
-    LaunchedEffect(days, selectedDay) {
-        val byDay = runCatching {
-            viewModel.repo.resolvedSeries("sleep_performance", "my-whoop", "0000-00-00", "9999-99-99")
-                .values.associate { it.first to it.second }
-        }.getOrDefault(emptyMap())
         val cutoff = selectedDay.minusDays(13).toString()
         val end = selectedDay.toString()
         restCompositeSpark = byDay.entries
             .filter { it.key in cutoff..end }
             .sortedBy { it.key }
             .map { it.value }
+        provenanceSleep = resolution?.points?.lastOrNull { it.day == selectedDayKey }?.source
     }
 
-    // Provenance (COMPONENT 4): the REAL per-metric merge winner for the selected day's derived scores,
-    // keyed by metric key ("recovery" / "sleep_performance"); each value is the RAW source id the resolver
-    // returned (e.g. "my-whoop", "my-whoop-noop", "apple-health"). resolvedSeries applies the SAME
-    // imported-WHOOP > NOOP-computed > Apple-Health precedence the dashboard merge uses field-by-field
-    // (WhoopRepository.mergeDaily), so the badge under each ring names the source that ACTUALLY supplied
-    // that day's number rather than a blanket day-level deviceId. Mirrors the Swift Today lane's
-    // `provenanceByMetric` resolution exactly (the winner is the last resolved point on selectedDayKey).
-    var provenanceByMetric by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+    // The RECOVERY ring's provenance winner: a separate metric series, so a separate (single) resolve.
+    var provenanceRecovery by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(days, selectedDayKey) {
-        val resolved = mutableMapOf<String, String>()
-        for (key in listOf("recovery", "sleep_performance")) {
-            val win = runCatching {
-                viewModel.repo.resolvedSeries(key, "my-whoop", "0000-00-00", "9999-99-99")
-                    .points.lastOrNull { it.day == selectedDayKey }?.source
-            }.getOrNull()
-            if (win != null) resolved[key] = win
+        provenanceRecovery = runCatching {
+            viewModel.repo.resolvedSeries("recovery", "my-whoop", "0000-00-00", "9999-99-99")
+                .points.lastOrNull { it.day == selectedDayKey }?.source
+        }.getOrNull()
+    }
+
+    // The per-metric merge winners keyed by metric key ("recovery" / "sleep_performance"), the shape the
+    // ring SourceBadges consume. A key is present only when that metric actually resolved a winner for the
+    // day (absent ⇒ no badge), preserving the previous single-map semantics.
+    val provenanceByMetric = remember(provenanceRecovery, provenanceSleep) {
+        buildMap {
+            provenanceRecovery?.let { put("recovery", it) }
+            provenanceSleep?.let { put("sleep_performance", it) }
         }
-        provenanceByMetric = resolved
     }
 
     // LIVE in-progress Effort for TODAY (#402), mirrors the iOS TodayView live-Effort fix. The stored
@@ -767,21 +774,59 @@ fun TodayScreen(
             val zone = ZoneId.systemDefault()
             val start = selectedDay.atStartOfDay(zone).toEpochSecond()
             val now = System.currentTimeMillis() / 1000
-            // #908: read the active strap ∪ canonical "my-whoop" union, NOT a hardcoded "my-whoop". A strap
-            // re-added through the device manager banks its live HR under its own fresh id, so a pinned
-            // "my-whoop" read returned nothing and Effort integrated to 0 off an empty series. Single-WHOOP
-            // install resolves to "my-whoop" ⇒ one id ⇒ byte-identical read.
-            val todayHr = runCatching { viewModel.repo.hrSamplesUnion(viewModel.activeStrapId, start, now) }
-                .getOrDefault(emptyList())
-            // effMaxHR resolution matches AnalyticsEngine: manual HR-max override first, else Tanaka from age.
+            // The exact StrainScorer inputs, resolved BEFORE the watermark so both the cache key and the
+            // recompute below see identical values. effMaxHR matches AnalyticsEngine: manual HR-max override
+            // first, else Tanaka from age. restingHR is the day's resting HR else the default; sex is passed
+            // through (ignored by the default EDWARDS method, but folded into the key so it can never pin a
+            // stale value if the method/inputs change).
             val effMaxHR = profileStore.hrMaxOverride.takeIf { it > 0 }?.toDouble()
                 ?: if (profileStore.age > 0) StrainScorer.tanakaHRmax(profileStore.age.toDouble()) else null
-            StrainScorer.strain(
-                hr = todayHr,
-                maxHR = effMaxHR,
-                restingHR = displayMetric?.restingHr?.toDouble() ?: StrainScorer.defaultRestingHR,
-                sex = profileStore.sex,
-            )
+            val restingHR = displayMetric?.restingHr?.toDouble() ?: StrainScorer.defaultRestingHR
+            val sex = profileStore.sex
+            // PERF (#402): this effect re-fires on every tab-return re-mount and every `days` re-emission (any
+            // daily-metric write, the 15-min analyze pass, an import), but the raw HR window it integrates
+            // usually hasn't changed. Take a CHEAP indexed fingerprint first: if it matches the last
+            // integration's watermark, StrainScorer would return the same number , reuse the cached Effort
+            // instead of re-reading ~86k raw rows and re-integrating. The cache lives on the ViewModel so it
+            // survives the re-mount that resets this screen's `remember` state. A bare `days`-hash guard
+            // (#849) wouldn't work: the HR series grows independently of `days`, so the watermark is keyed on
+            // the HR window itself. The fingerprint must span EVERYTHING the Effort depends on: the PPG-union
+            // sample set (count/avg/max — and MIN(ts)/MAX(ts)/2nd-ts for the span gate + first-two-sample
+            // duration, so a PPG-only append or a timestamp re-bank invalidates it) AND the non-HR params
+            // (effMaxHR, restingHR, sex), so a param change or a re-scored resting HR recomputes rather than
+            // returning a value computed with the old parameters.
+            val sig = runCatching {
+                buildString {
+                    append(selectedDayKey)
+                    append('#').append(effMaxHR).append(',').append(restingHR).append(',').append(sex)
+                    viewModel.repo.hrWindowFingerprintUnion(viewModel.activeStrapId, start, now).forEach {
+                        append('|').append(it.n).append(',').append(it.avg).append(',').append(it.max)
+                            .append(',').append(it.minTs).append(',').append(it.maxTs).append(',').append(it.ts2)
+                    }
+                }
+            }.getOrNull()
+            if (sig != null && sig == viewModel.liveTodayStrainSig) {
+                viewModel.liveTodayStrainCache
+            } else {
+                // #908: read the active strap ∪ canonical "my-whoop" union, NOT a hardcoded "my-whoop". A strap
+                // re-added through the device manager banks its live HR under its own fresh id, so a pinned
+                // "my-whoop" read returned nothing and Effort integrated to 0 off an empty series. Single-WHOOP
+                // install resolves to "my-whoop" ⇒ one id ⇒ byte-identical read.
+                val todayHr = runCatching { viewModel.repo.hrSamplesUnion(viewModel.activeStrapId, start, now) }
+                    .getOrDefault(emptyList())
+                val result = StrainScorer.strain(
+                    hr = todayHr,
+                    maxHR = effMaxHR,
+                    restingHR = restingHR,
+                    sex = sex,
+                )
+                // Only cache once the watermark read succeeded, so a transient failure never pins a stale Effort.
+                if (sig != null) {
+                    viewModel.liveTodayStrainSig = sig
+                    viewModel.liveTodayStrainCache = result
+                }
+                result
+            }
         } else {
             null
         }
@@ -4465,10 +4510,17 @@ private fun HeartRateTrendCard(
     // advances through a long backfill so the curve fills in progressively rather than only at the end.
     // (No "show a past day curve" fallback, rejected behaviour change; this only re-queries the SAME
     // selected-day window when fresh samples land.) Mirrors the iOS Today HR lane keying off the sync state.
+    // PERF (#scroll-jank): the BLE live state ticks the heart rate roughly once a second. Reading the raw
+    // `live` object in this card body would recompose the WHOLE trend card (header, pills, zoom state,
+    // chart) on every bpm change - the same jank the top-level TodayLiveSnapshot funnel exists to prevent.
+    // This card only needs the two sync tokens (lastSyncAt + syncChunksThisSession), so read `live` ONLY
+    // inside a `derivedStateOf` that projects those two: a 72->73 bpm tick produces an EQUAL pair and does
+    // NOT recompose the card; the pair changes only when a sync actually advances. Mirrors liveSnap above.
     val live by viewModel.live.collectAsStateWithLifecycle()
+    val syncTokens by remember { derivedStateOf { live.lastSyncAt to live.syncChunksThisSession } }
     // Re-load when the day list changes (an import updates it), when the day selector moves, and, via the
     // sync tokens, when a strap offload banks fresh HR samples for the current window. Also on first compose.
-    LaunchedEffect(days, selectedDay, today, live.lastSyncAt, live.syncChunksThisSession) {
+    LaunchedEffect(days, selectedDay, today, syncTokens) {
         val zone = ZoneId.systemDefault()
         val start = selectedDay.atStartOfDay(zone).toEpochSecond()
         val nextStart = selectedDay.plusDays(1).atStartOfDay(zone).toEpochSecond()

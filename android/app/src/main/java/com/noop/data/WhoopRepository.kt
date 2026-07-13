@@ -443,15 +443,23 @@ class WhoopRepository(private val dao: WhoopDao) {
      *  Motion is written ONLY under the computed ("-noop") source by the engine, so we read there; an
      *  imported-only night (no computed twin) has no motion (absent stays absent , an honest empty state,
      *  never a fabricated zero array). Does NOT resolve the night: the caller has already chosen the
-     *  main-night GROUP and passes those blocks' starts. A start with no stored series is omitted. Mirrors
-     *  iOS Repository.sessionMotions. */
+     *  main-night GROUP and passes those blocks' starts. A start with no stored series is omitted.
+     *
+     *  UNION the active strap's computed id AND the canonical "my-whoop-noop" sibling (#814/#1008), the SAME
+     *  idiom [sleepSessionsUnion]/[habitualMidsleepSec] use: after a strap remove+re-add the active id is a
+     *  fresh "whoop-<uuid>", but older nights' motion still lives under "my-whoop-noop", so reading only the
+     *  active computed id would drop them. Per start we take the FIRST namespace that has a series (active
+     *  first, matching [computedSourceIds]' active-first order); a single-strap install collapses to one id,
+     *  byte-identical. Mirrors iOS Repository.sessionMotions. */
     suspend fun sessionMotions(strapDeviceId: String, starts: List<Long>): Map<Long, List<Double>> {
         if (starts.isEmpty()) return emptyMap()
-        val computedId = computedDeviceId(strapDeviceId)
+        val computedIds = computedSourceIds(strapDeviceId)
         val out = HashMap<Long, List<Double>>()
         for (start in starts) {
-            val m = dao.sessionMotionJson(computedId, start)?.let { decodeDoubleArray(it) }
-            if (!m.isNullOrEmpty()) out[start] = m
+            for (computedId in computedIds) {
+                val m = dao.sessionMotionJson(computedId, start)?.let { decodeDoubleArray(it) }
+                if (!m.isNullOrEmpty()) { out[start] = m; break }
+            }
         }
         return out
     }
@@ -502,6 +510,24 @@ class WhoopRepository(private val dao: WhoopDao) {
      */
     suspend fun hrSamplesUnion(activeDeviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT):
         List<HrSample> = mergeHrByTs(importedSourceIds(activeDeviceId).map { dao.hrSamples(it, from, to, limit) })
+
+    /**
+     * Cheap per-source change-fingerprint over the SAME read-side union as [hrSamplesUnion] (count / avg /
+     * max bpm PLUS min-ts / max-ts / second-ts, one indexed (deviceId,ts) range scan each, no row
+     * materialisation). Backs the live-Effort re-mount cache (#402): if every source's fingerprint is
+     * unchanged the union sample set — and every timestamp [StrainScorer] reads (span gate + first-two
+     * sample duration) — is unchanged, so a re-integration returns the same Effort and the screen can skip
+     * the full raw read + StrainScorer. Aggregates the measured `hrSample` ∪ v26 PPG-derived `ppgHrSample`
+     * union (not `hrSample` alone), so a PPG-only append still moves the fingerprint. Order matches
+     * [importedSourceIds]. Single-WHOOP install ⇒ one id.
+     */
+    suspend fun hrWindowFingerprintUnion(
+        activeDeviceId: String,
+        from: Long,
+        to: Long,
+        limit: Int = DEFAULT_LIMIT,
+    ): List<HrWindowFingerprint> =
+        importedSourceIds(activeDeviceId).map { dao.hrWindowFingerprint(it, from, to, limit) }
 
     /** Raw measured HR only (no v26 PPG-derived union) for the raw-sensor diagnostic export. */
     suspend fun rawHrSamples(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =

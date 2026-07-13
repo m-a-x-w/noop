@@ -61,6 +61,13 @@ struct SleepView: View {
     /// gaps preserved. Oldest→newest. Falls back to `repo.sleeps` until loaded. (#170)
     @State private var allSessions: [CachedSleepSession] = []
 
+    /// Memoized `navDays` grouping — the per-session Calendar `startOfDay` grouping + the day/within-day
+    /// sorts over the full un-deduplicated session history are expensive, so we run them ONCE at each
+    /// data-change point (the `.task`, the data-key onChange, onAppear) and cache the result here rather
+    /// than recomputing on every body pass (hover / animation / 1Hz HR ticks). Empty until first populated;
+    /// `navDays` falls back to an inline compute while empty so the first frame is never blank (#170).
+    @State private var navDaysCache: [[CachedSleepSession]] = []
+
     /// The user's LEARNED habitual midsleep (local time-of-day seconds), or nil under the cold-start
     /// threshold. Loaded from `repo.habitualMidsleepSec()` — the SAME value `AnalyticsEngine.analyzeDay`
     /// threads into the daily total — and fed into the main-night selector so the hero, the naps split,
@@ -152,6 +159,9 @@ struct SleepView: View {
             // `resolved` already drives THIS frame, so there is no flash and no extra rebuild.
             .onChangeCompat(of: key) { newKey in
                 modelKey = newKey
+                // Refresh the day grouping (repo.sleeps may have changed the fallback list) before
+                // buildModel reads navDays.
+                navDaysCache = SleepView.groupNavDays(navSessions)
                 model = buildModel()
                 // New data invalidates a navigated offset — the same offset would silently
                 // point at a different session. Snap back to last night. (#160)
@@ -166,6 +176,9 @@ struct SleepView: View {
             .onAppear {
                 if modelKey != key {
                     modelKey = key
+                    // Populate the day-grouping cache on first appear so subsequent body passes read the
+                    // memoized array instead of recomputing the grouping per frame.
+                    navDaysCache = SleepView.groupNavDays(navSessions)
                     model = resolved
                     nightOffset = 0
                     navNight = nil
@@ -186,6 +199,9 @@ struct SleepView: View {
                 motionByStart = await repo.sessionMotions(starts: allSessions.map { $0.startTs })
                 nightOffset = 0
                 navNight = nil
+                // Rebuild the day grouping from the freshly-loaded blocks BEFORE buildModel — it reads
+                // navDays (via latestNight / dayBlocks), so the cache must reflect the new sessions first.
+                navDaysCache = SleepView.groupNavDays(navSessions)
                 modelKey = dataKey
                 model = buildModel()
             }
@@ -1388,12 +1404,23 @@ struct SleepView: View {
     /// dashboard's per-night merge), newest day first, blocks within a day oldest→newest. Each day
     /// is ONE ◀/▶ stop, so a split-sleep day reads as a single night and the "N nights ago" label
     /// stays truthful — two blocks of the same day are never "1 night ago" AND "2 nights ago". (#170)
+    /// Reads the memoized `navDaysCache` (rebuilt at every data-change point), so the per-session
+    /// Calendar grouping + sorts never run on the many body re-evaluations (hover / animation / 1Hz
+    /// HR ticks). Falls back to an inline compute only while the cache is empty — the very first frame,
+    /// before any rebuild handler has fired — so the hero is never blank (#170); once populated the
+    /// body reads the cache untouched.
     private var navDays: [[CachedSleepSession]] {
+        navDaysCache.isEmpty ? SleepView.groupNavDays(navSessions) : navDaysCache
+    }
+
+    /// Pure grouping shared by the memoized cache and the first-frame fallback: every block grouped by
+    /// the calendar day it ENDS on, newest day first, blocks within a day oldest→newest.
+    private static func groupNavDays(_ sessions: [CachedSleepSession]) -> [[CachedSleepSession]] {
         let cal = Calendar.current
         func endDay(_ s: CachedSleepSession) -> Date {
             cal.startOfDay(for: Date(timeIntervalSince1970: TimeInterval(s.endTs)))
         }
-        let groups = Dictionary(grouping: navSessions, by: endDay)
+        let groups = Dictionary(grouping: sessions, by: endDay)
         return groups.keys.sorted(by: >).map { key in
             (groups[key] ?? []).sorted { $0.effectiveStartTs < $1.effectiveStartTs }
         }

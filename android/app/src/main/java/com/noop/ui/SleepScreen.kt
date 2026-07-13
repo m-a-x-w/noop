@@ -154,14 +154,27 @@ fun SleepScreen(
     // "-noop" sessions on days the import doesn't cover (imported-wins / computed-fills, mirroring
     // mergeSleep but WITHOUT the per-night collapse). Keyed on `days` so a sync/import (which always
     // rewrites dailyMetric too) reloads; these reads have no Flow. (#160, #170)
-    var sleeps by remember { mutableStateOf<List<SleepSession>>(emptyList()) }
+    // #849: seed from the ViewModel cache so a re-mount (tab-return / post-import) restores the last loaded
+    // sleep list immediately instead of re-running the full-history union while the (now-guarded) reload is
+    // skipped for unchanged data. `null` cache → the honest empty first-run state.
+    var sleeps by remember { mutableStateOf(vm.sleepScreenSleepsCache ?: emptyList<SleepSession>()) }
     // 0 = latest night, N = N sleep-sessions back. Reset to the newest night only on a REAL data
     // reload (new sync / re-import via `days` changing). The optimistic bed/wake edit rewrites
     // `sleeps` in place WITHOUT touching `days`, so it must not reset the browse — keeping the
     // user on the night they just edited. (#160)
     var nightOffset by remember { mutableIntStateOf(0) }
     LaunchedEffect(days) {
-        sleeps = runCatching {
+        // #849 re-mount guard: skip the whole-history union re-read when `days` is content-identical to the
+        // last load (data-class hashCode is a stable structural signature). The signature + cached list live
+        // on the long-lived ViewModel, so a tab-return / post-import re-mount restores the list (already
+        // seeded above) without re-reading, re-keying and re-sorting thousands of rows. Fold activeStrapId
+        // into the signature: the load reads the active∪canonical union, so switching the active device must
+        // invalidate the cache even when `days` is byte-identical (else a stale device's list is served).
+        val sig = 31 * days.hashCode() + vm.activeStrapId.hashCode()
+        if (vm.sleepScreenSleepsSig == sig) return@LaunchedEffect
+        // Only cache + stamp the signature on a SUCCESSFUL load: a transient DB failure must not pin an
+        // empty list under this signature (which would then be served on every unchanged re-mount).
+        val loaded = runCatching {
             val now = System.currentTimeMillis() / 1000L
             // Read the ACTIVE-strap ∪ canonical "my-whoop" union (#814/#1008), not the canonical id
             // alone: after a strap remove+re-add live nights land under the fresh "whoop-<uuid>" id, so
@@ -182,8 +195,13 @@ fun SleepScreen(
             val computedOnly = computed.filter { localEndDay(it.endTs) !in importedDays }
             // Sort by the EFFECTIVE onset so a hand-edited bedtime orders the night correctly. (PR #395)
             (imported + computedOnly).sortedBy { it.effectiveStartTs }
-        }.getOrDefault(emptyList())
+        }.getOrNull() ?: return@LaunchedEffect
+        sleeps = loaded
         nightOffset = 0
+        // Cache the loaded list + signature so a later re-mount with unchanged `days` restores it and
+        // short-circuits the union re-read above.
+        vm.sleepScreenSleepsCache = sleeps
+        vm.sleepScreenSleepsSig = sig
     }
 
     // #65: the transient UNDO banner shown after a suppressing delete. Holds the deleted SleepSession
@@ -204,38 +222,55 @@ fun SleepScreen(
     // and the edit target pick the SAME block the analytics rollup did, for a shift/late sleeper too.
     // null keeps the existing cold-start overnight-band fallback. Keyed on `days` so it refreshes
     // alongside `sleeps`. Mirrors iOS SleepView.habitualMidsleepSec. (#547)
-    var habitualMidsleep by remember { mutableStateOf<Long?>(null) }
+    // #849: seed from the ViewModel cache so a re-mount restores the learned midsleep without re-scanning
+    // the night history. A cached `null` is the honest cold-start value, restored the same way.
+    var habitualMidsleep by remember { mutableStateOf(vm.sleepScreenHabitualCache) }
     LaunchedEffect(days) {
+        // #849 re-mount guard: skip the learner re-scan when `days` is content-identical to the last load.
+        // Fold activeStrapId into the signature: the learner reads the active∪canonical union, so switching
+        // the active device must invalidate the cache even when `days` is byte-identical.
+        val sig = 31 * days.hashCode() + vm.activeStrapId.hashCode()
+        if (vm.sleepScreenHabitualSig == sig) return@LaunchedEffect
         // Thread the ACTIVE strap id so the learner unions active + canonical nights (#814/#1008);
         // habitualMidsleepSec resolves the canonical "my-whoop" sibling internally either way.
-        habitualMidsleep = runCatching { vm.repo.habitualMidsleepSec(vm.activeStrapId) }.getOrNull()
-    }
-
-    // Persisted per-epoch MOTION keyed by each session's detected startTs (#407). Loaded alongside
-    // `sleeps`; `selectNight` reads only the ALREADY-resolved main-night GROUP's entries (no re-resolution)
-    // and lays them along the hypnogram's timeline. A block with no stored series stays absent (honest empty
-    // state for older rows whose motionJSON is NULL). Mirrors iOS SleepView.motionByStart.
-    var motionByStart by remember { mutableStateOf<Map<Long, List<Double>>>(emptyMap()) }
-    LaunchedEffect(sleeps) {
-        motionByStart = runCatching {
-            vm.repo.sessionMotions("my-whoop", sleeps.map { it.startTs })
-        }.getOrDefault(emptyMap())
+        // Only cache + stamp the signature on a SUCCESSFUL load: a transient DB failure must not pin a
+        // null (cold-start) result under this signature and suppress the real learned value on re-mount.
+        val loaded = runCatching { vm.repo.habitualMidsleepSec(vm.activeStrapId) }
+        if (loaded.isFailure) return@LaunchedEffect
+        habitualMidsleep = loaded.getOrNull()
+        vm.sleepScreenHabitualCache = habitualMidsleep
+        vm.sleepScreenHabitualSig = sig
     }
 
     // Export-verbatim sleep figures (sleep_performance / consistency / need / debt) — the
     // headline tiles prefer them over the on-device approximations. Keyed on `days` so a
     // fresh import (which always rewrites dailyMetric too) reloads; metricSeries has no Flow.
-    var imported by remember { mutableStateOf(ImportedSleepSeries()) }
+    // #849: seed from the ViewModel cache so a re-mount restores the imported figures without re-reading the
+    // four full-history series.
+    var imported by remember { mutableStateOf(vm.sleepScreenImportedCache ?: ImportedSleepSeries()) }
     LaunchedEffect(days) {
-        suspend fun load(key: String) = runCatching {
-            vm.repo.metricSeries("my-whoop", key, "0000-00-00", "9999-99-99")
-        }.getOrDefault(emptyList()).associate { it.day to it.value }
-        imported = ImportedSleepSeries(
-            performance = load("sleep_performance"),
-            consistency = load("sleep_consistency"),
-            needMin = load("sleep_need_min"),
-            debtMin = load("sleep_debt_min"),
-        )
+        // #849 re-mount guard: skip the four full-history series reads when `days` is content-identical.
+        // Fold activeStrapId into the signature so all three Sleep loads key their caches identically (this
+        // series is canonical-"my-whoop"-anchored, so the id doesn't change the read — it just keeps the
+        // three signatures consistent and invalidates in lockstep on a device switch).
+        val sig = 31 * days.hashCode() + vm.activeStrapId.hashCode()
+        if (vm.sleepScreenImportedSig == sig) return@LaunchedEffect
+        // Only cache + stamp the signature when ALL FOUR series load: wrap the reads in one runCatching so a
+        // transient DB failure bubbles out (rather than a per-key empty fallback silently pinning an empty
+        // series under this signature and serving it on every unchanged re-mount).
+        val loaded = runCatching {
+            suspend fun load(key: String) =
+                vm.repo.metricSeries("my-whoop", key, "0000-00-00", "9999-99-99").associate { it.day to it.value }
+            ImportedSleepSeries(
+                performance = load("sleep_performance"),
+                consistency = load("sleep_consistency"),
+                needMin = load("sleep_need_min"),
+                debtMin = load("sleep_debt_min"),
+            )
+        }.getOrNull() ?: return@LaunchedEffect
+        imported = loaded
+        vm.sleepScreenImportedCache = imported
+        vm.sleepScreenImportedSig = sig
     }
 
     val context = LocalContext.current
@@ -326,6 +361,30 @@ fun SleepScreen(
             .map { (_, blocks) -> blocks.sortedBy { it.effectiveStartTs } }
     }
 
+    // Persisted per-epoch MOTION keyed by each session's detected startTs (#407). `selectNight` reads only the
+    // ALREADY-resolved main-night GROUP's entries (no re-resolution) and lays them along the hypnogram's
+    // timeline. A block with no stored series stays absent (honest empty state for older rows whose motionJSON
+    // is NULL). Mirrors iOS SleepView.motionByStart.
+    var motionByStart by remember { mutableStateOf<Map<Long, List<Double>>>(emptyMap()) }
+    LaunchedEffect(nightOffset, navDays, habitualMidsleep) {
+        // PERF (#407): `selectNight` lays motion ONLY along the RESOLVED main-night GROUP (it reads just that
+        // group's starts from this map), so load exactly that group's series instead of firing sessionMotions
+        // across EVERY session ever recorded — the old `sleeps`-keyed load was an N+1 (one Room query + a
+        // per-epoch JSON decode per session) over the whole history, re-run on every reload and re-mount. We
+        // resolve the browsed day's group through the SAME `mainSleepGroup` selector `selectNight` uses (keyed
+        // on the group inputs: the browsed day + the learned midsleep), so the loaded starts always cover the
+        // hero's group — the rendered hypnogram motion is byte-identical, just no longer full-history. Pass the
+        // ACTIVE strap id (not a hardcoded "my-whoop"); sessionMotions resolves the computed "-noop" sibling.
+        val dayIdx = nightOffset.coerceIn(0, (navDays.size - 1).coerceAtLeast(0))
+        val groupStarts = navDays.getOrNull(dayIdx)
+            ?.let { mainSleepGroup(it, habitualMidsleep) }
+            ?.map { it.startTs }
+            ?: emptyList()
+        motionByStart = runCatching {
+            vm.repo.sessionMotions(vm.activeStrapId, groupStarts)
+        }.getOrDefault(emptyMap())
+    }
+
     // The navigated night, decoded once per (offset, data) change — chevron taps re-pick
     // instantly without re-parsing stagesJSON on every recomposition. The offset now indexes
     // DAYS (navDays), so a day with a detected night always resolves to that night. (#160, #59)
@@ -387,6 +446,9 @@ fun SleepScreen(
                                 vm.repo.sleepSessionsUnion(vm.activeStrapId, 0L, now) +
                                     vm.repo.computedSleepSessionsUnion(vm.activeStrapId, 0L, now)
                             }.getOrDefault(sleeps)
+                            // #849: this rewrites `sleeps` without changing `days`, so refresh the VM cache in
+                            // lockstep — otherwise a re-mount would restore the stale pre-undo list.
+                            vm.sleepScreenSleepsCache = sleeps
                         }
                     },
                 )
@@ -467,6 +529,10 @@ fun SleepScreen(
                                 it
                             }
                         }
+                        // #849: the optimistic edit rewrites `sleeps` without touching `days`, so refresh the
+                        // VM cache in lockstep — a re-mount before the durable write lands must restore THIS
+                        // edited list, not the stale pre-edit one the DB still holds.
+                        vm.sleepScreenSleepsCache = sleeps
                         scope.launch { vm.updateSleepSessionTimes(s, safeStart, safeEnd) }
                     } else {
                         // The clamp refused a future/inverted window. Never drop an edit silently (the nap
@@ -486,6 +552,9 @@ fun SleepScreen(
                     // #65: offer a transient UNDO. `s` still carries its owning deviceId + userEdited,
                     // everything undo needs to restore it into the original namespace.
                     sleeps = sleeps.filterNot { it.deviceId == s.deviceId && it.startTs == s.startTs }
+                    // #849: optimistic delete rewrites `sleeps` without touching `days`; refresh the VM cache
+                    // so a re-mount restores the post-delete list rather than resurrecting the removed night.
+                    vm.sleepScreenSleepsCache = sleeps
                     sleepUndo = s
                     scope.launch { vm.deleteSleepSession(s) }
                 },
@@ -509,6 +578,9 @@ fun SleepScreen(
                             val computedOnly = computed.filter { localEndDay(it.endTs) !in importedDays }
                             (imported + computedOnly).sortedBy { it.effectiveStartTs }
                         }.getOrDefault(sleeps)
+                        // #849: the post-nap reload rewrites `sleeps` without changing `days`, so refresh the
+                        // VM cache in lockstep — otherwise a re-mount would drop the just-added nap.
+                        vm.sleepScreenSleepsCache = sleeps
                     }
                 },
                 onPickNightDate = onPickNightDate,

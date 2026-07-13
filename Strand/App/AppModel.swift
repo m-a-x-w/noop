@@ -101,6 +101,16 @@ final class AppModel: ObservableObject {
     /// Android's `ActiveWorkout.gpsEnabled`.
     private var activeWorkoutIsGps = false
 
+    /// Last time the in-flight workout's durable snapshot was written (#529). `persistActiveWorkout`
+    /// re-encodes the ENTIRE accumulated HR window to `UserDefaults`, so doing it per ~1 Hz sample makes
+    /// a growing session O(n²) of JSON-encode + defaults-write churn on the main actor. Throttle the
+    /// per-sample persist to `workoutPersistInterval`: normal operation is unchanged (nothing reads the
+    /// snapshot while the session is live), and a mid-session kill still recovers everything up to at most
+    /// the last interval — the coarse durability #529 needs. Reset on Start so the first sample persists.
+    private var lastWorkoutPersistAt: Date = .distantPast
+    /// Minimum spacing between per-sample durable snapshots of the active workout (seconds).
+    private static let workoutPersistInterval: TimeInterval = 15
+
     /// A manual workout in progress. `samples` accumulate from the smoothed live `bpm`; `liveStrain`
     /// is recomputed as the window grows so the active card can show strain building in real time.
     struct ActiveWorkout: Equatable {
@@ -113,6 +123,10 @@ final class AppModel: ObservableObject {
         var liveStrain: Double = 0
         var avgHr: Int = 0
         var peakHr: Int = 0
+        /// Running Σ of every sample's bpm, kept in step with `samples` so `avgHr` is an O(1) update
+        /// instead of an O(n) `map`+`reduce` over the whole window on every ~1 Hz sample. Not persisted
+        /// (the durable Snapshot stores `avgHr` directly); rebuilt from `samples` on rehydrate.
+        var bpmSum: Int = 0
     }
     /// Illness/strain early-warning (recent RHR up + HRV down + skin-temp up vs baseline). nil = clear.
     @Published var healthAlert: String?
@@ -544,6 +558,9 @@ final class AppModel: ObservableObject {
         }
         // Make the session durable from the first instant (#529): persist it now so an OS kill right
         // after Start , before any HR sample lands , can still be rehydrated + ended on relaunch.
+        // Arm the per-sample persist throttle so the FIRST captured sample writes immediately (early
+        // coverage), then settles into the throttled cadence.
+        lastWorkoutPersistAt = .distantPast
         persistActiveWorkout()
         // Workouts & GPS test mode (Test Centre): one session-start line tagged `.workouts`. Zero-cost when
         // off (the gate is one UserDefaults bool read), so the lifecycle of a missing workout is visible.
@@ -615,6 +632,10 @@ final class AppModel: ObservableObject {
         w.avgHr = snap.avgHr
         w.peakHr = snap.peakHr
         w.liveStrain = snap.liveStrain
+        // Seed the running bpm sum from the (bound-checked, possibly filtered) rehydrated samples so the
+        // next captured sample's O(1) avgHr update matches what a full re-sum would have produced. The
+        // displayed avgHr stays `snap.avgHr` until then — identical to the prior full-recompute path.
+        w.bpmSum = snap.samples.reduce(0) { $0 + $1.bpm }
         activeWorkout = w
     }
 
@@ -700,11 +721,20 @@ final class AppModel: ObservableObject {
         guard var w = activeWorkout, let hr = bpm else { return }
         w.samples.append(HRSample(ts: Int(Date().timeIntervalSince1970), bpm: hr))
         w.peakHr = max(w.peakHr, hr)
-        w.avgHr = Int((Double(w.samples.map(\.bpm).reduce(0, +)) / Double(w.samples.count)).rounded())
+        // O(1) running mean: fold the new bpm into `bpmSum` rather than re-summing the whole window
+        // (identical result — both are the exact integer Σ over `samples` divided by the count).
+        w.bpmSum += hr
+        w.avgHr = Int((Double(w.bpmSum) / Double(w.samples.count)).rounded())
         w.liveStrain = StrainScorer.strain(w.samples, maxHR: Double(profile.hrMax), sex: profile.sex) ?? 0
         activeWorkout = w
-        // Re-snapshot the durable session so a kill keeps the latest accumulated HR window (#529).
-        persistActiveWorkout()
+        // Re-snapshot the durable session so a kill keeps the latest accumulated HR window (#529). The
+        // encode re-serializes the whole growing window, so throttle it: a per-sample write is O(n²) blob
+        // churn for a durability guarantee that tolerates losing the last few seconds.
+        let now = Date()
+        if now.timeIntervalSince(lastWorkoutPersistAt) >= Self.workoutPersistInterval {
+            lastWorkoutPersistAt = now
+            persistActiveWorkout()
+        }
     }
 
     /// Drop the smoothing window and blank the hero number so a resume / re-attach shows ","

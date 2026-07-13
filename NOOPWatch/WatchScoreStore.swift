@@ -69,8 +69,14 @@ final class WatchScoreStore: NSObject, ObservableObject, WCSessionDelegate {
     /// Apply a freshly received snapshot: store it, publish to the glance, refresh the complication.
     /// Hops to the main actor because it touches @Published state and WidgetCenter.
     private func apply(_ snap: WatchScoreSnapshot) {
-        persist(snap)
         DispatchQueue.main.async {
+            // Freshness guard: several delivery paths can now race — the application context handed over on
+            // activation, the reachable sendMessage fast-path, and the launch requestLatest reply (which
+            // carries the phone's app-group value that may be OLDER than a context already applied). Keep
+            // whichever snapshot the phone built more recently so an out-of-order or replayed message can't
+            // regress the glance to older scores. `asOf` is the phone's build time, monotonic per snapshot.
+            if let current = self.snapshot, snap.asOf < current.asOf { return }
+            self.persist(snap)
             self.snapshot = snap
             // The phone just pushed new scores, so pull the complication timelines forward now rather
             // than waiting for WidgetKit's own cadence.
@@ -85,6 +91,27 @@ final class WatchScoreStore: NSObject, ObservableObject, WCSessionDelegate {
         return try? JSONDecoder().decode(WatchScoreSnapshot.self, from: data)
     }
 
+    /// The message key the phone's reply handler matches on to hand back the latest snapshot. Must equal
+    /// `WatchSessionBridge.requestLatestKey` ("requestLatest"), which lives in the iOS-only bridge and so
+    /// can't be referenced across the target boundary from here.
+    static let requestLatestKey = "requestLatest"
+
+    /// Actively ask the phone for its latest snapshot right now. Only meaningful when the session is
+    /// reachable (phone app foregrounded); otherwise we simply keep showing the last persisted snapshot.
+    /// The reply carries the same "snapshot" Data payload the phone pushes via application context, so it
+    /// decodes through `decode(from:)`. Fire-and-forget: a failed request is safe to ignore because the
+    /// application-context channel still delivers the latest state.
+    func requestLatestSnapshot() {
+        guard WCSession.isSupported() else { return }
+        let session = WCSession.default
+        guard session.activationState == .activated, session.isReachable else { return }
+        session.sendMessage([Self.requestLatestKey: true], replyHandler: { [weak self] reply in
+            if let snap = self?.decode(from: reply) {
+                self?.apply(snap)
+            }
+        }, errorHandler: { _ in })
+    }
+
     // MARK: WCSessionDelegate
 
     func session(_ session: WCSession,
@@ -95,12 +122,24 @@ final class WatchScoreStore: NSObject, ObservableObject, WCSessionDelegate {
         if let snap = decode(from: session.receivedApplicationContext) {
             apply(snap)
         }
+        // If the phone is reachable right now (its app is foregrounded), pull the very latest snapshot at
+        // once rather than waiting for the next dashboard-driven push. The freshness guard in `apply`
+        // keeps whichever value is newer, so this can't regress a context we just picked up above.
+        requestLatestSnapshot()
     }
 
     /// The phone calls `updateApplicationContext` whenever its dashboard refreshes. Latest-state only, so
     /// we always have the freshest scores without a backlog of stale messages.
     func session(_ session: WCSession, didReceiveApplicationContext applicationContext: [String: Any]) {
         if let snap = decode(from: applicationContext) {
+            apply(snap)
+        }
+    }
+
+    /// The reachable fast-path: while the watch is on the wrist the phone ALSO delivers each fresh snapshot
+    /// via `sendMessage` (no reply). Same "snapshot" payload, same decode + freshness-guarded apply.
+    func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
+        if let snap = decode(from: message) {
             apply(snap)
         }
     }

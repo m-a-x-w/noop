@@ -1425,17 +1425,38 @@ final class IntelligenceEngine: ObservableObject {
                                 strapRecoveryDays: Set<String> = []) -> [WatchScoredDay] {
         let rows = appleRows.sorted { $0.day < $1.day }
         var out: [WatchScoredDay] = []
-        for (i, row) in rows.enumerated() where !strapRecoveryDays.contains(row.day) {
-            // Trailing baseline history = every earlier apple-health day with a usable value. Today is the
-            // current row; the baseline is built from the days BEFORE it so it can't see its own value.
-            let prior = rows[..<i]
-            let sdnnHistory = prior.compactMap { $0.avgHrv }
-            let rhrHistory = prior.compactMap { $0.restingHr.map(Double.init) }
-            let res = WatchRecovery.compute(todaySDNN: row.avgHrv,
-                                            todayRHR: row.restingHr,
-                                            sdnnHistory: sdnnHistory,
-                                            rhrHistory: rhrHistory)
-            out.append(WatchScoredDay(day: row.day, recovery: res.recovery, confidence: res.confidence))
+        // Carry the trailing SDNN/RHR baselines as running fold state instead of rebuilding the whole
+        // prior history (`rows[..<i]` + two compactMaps + two folds) for every row — that was O(n²) over
+        // years of Apple-health days. Each row scores against the state folded from the days BEFORE it,
+        // THEN folds its own values in, so it can't see its own value. State advances for EVERY row
+        // (including strap-scored ones we skip below): those days still belong in the trailing baseline.
+        // `sdnnNights` is the raw count of non-nil SDNN readings folded so far — the same number
+        // `sdnnHistory.count` gave the `minBaselineNights` gate (which counts nils-dropped values, NOT
+        // the baseline's `nValid` that also drops out-of-range nights). The empty seeds mirror what
+        // `Baselines.foldHistory([])` returns for a row with no prior history. Output is byte-identical.
+        let emptyHrv = Baselines.foldHistory([], cfg: Baselines.hrvCfg)
+        let emptyRHR = Baselines.foldHistory([], cfg: Baselines.restingHRCfg)
+        var hrvState: BaselineState? = nil
+        var rhrState: BaselineState? = nil
+        var sdnnNights = 0
+        for row in rows {
+            if !strapRecoveryDays.contains(row.day) {
+                let res = WatchRecovery.compute(todaySDNN: row.avgHrv,
+                                                todayRHR: row.restingHr,
+                                                hrvBaseline: hrvState ?? emptyHrv,
+                                                rhrBaseline: rhrState ?? emptyRHR,
+                                                sdnnNights: sdnnNights)
+                out.append(WatchScoredDay(day: row.day, recovery: res.recovery, confidence: res.confidence))
+            }
+            // Fold today's values into the trailing baselines, mirroring the `compactMap` upstream: nil
+            // readings contribute nothing (no skip-and-hold), matching the pre-fold history exactly.
+            if let hrv = row.avgHrv {
+                hrvState = Baselines.update(hrvState, value: hrv, cfg: Baselines.hrvCfg)
+                sdnnNights += 1
+            }
+            if let rhr = row.restingHr {
+                rhrState = Baselines.update(rhrState, value: Double(rhr), cfg: Baselines.restingHRCfg)
+            }
         }
         return out
     }

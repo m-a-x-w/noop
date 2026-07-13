@@ -82,6 +82,23 @@ data class HrWindowStats(
     val max: Int?,
 )
 
+/**
+ * Change-fingerprint of the [WhoopDao.hrSamples] read-side UNION (measured `hrSample` ∪ v26 PPG-derived
+ * `ppgHrSample`) over a window, for the live-Effort re-mount cache (#402). Unlike [HrWindowStats] this
+ * aggregates the SAME COALESCE union the Effort integration actually reads (so a PPG-only append moves
+ * the fingerprint), and additionally carries the timestamp shape [StrainScorer] depends on: [minTs]/[maxTs]
+ * bound the sparse-stream span gate, and [minTs]+[ts2] (the two smallest distinct ts) reproduce the
+ * first-two-sample duration. Query result of [WhoopDao.hrWindowFingerprint], not a table. All fields null
+ * when the window is empty; [ts2] null when fewer than two distinct timestamps. */
+data class HrWindowFingerprint(
+    val n: Long,
+    val avg: Double?,
+    val max: Int?,
+    val minTs: Long?,
+    val maxTs: Long?,
+    val ts2: Long?,
+)
+
 /** R-R interval. Swift `rrInterval` (v1). PK (deviceId, ts, rrMs), multiple R-R per ts. */
 @Entity(tableName = "rrInterval", primaryKeys = ["deviceId", "ts", "rrMs"])
 data class RrInterval(

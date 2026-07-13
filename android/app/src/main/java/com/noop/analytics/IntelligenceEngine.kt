@@ -559,9 +559,31 @@ object IntelligenceEngine {
             // Counts/bpm only; no timestamps or PII (the diag sink also scrubs). Byte-identical to Swift.
             val rhrFloor = res.daily.restingHr
             if (rhrFloor != null) {
-                val inBedBpms = hr.filter { s -> res.sleepSessions.any { s.ts >= it.start && s.ts < it.end } }
-                    .map { it.bpm }
-                diag(rhrFloorMeanLogLine(day, rhrFloor, inBedBpms))
+                // The mean is over the SAME matched in-bed span the floor came from. The old form built
+                // two transient lists (filter → map) over the whole night-window HR read (up to
+                // STREAM_LIMIT rows) on every scored day of every pass, just to feed one log line. Walk the
+                // sorted streams once, accumulating an Int bpm sum + count with no intermediate allocation:
+                // HR is ts-ascending (DAO ORDER BY ts) and a start-sorted session cursor advances
+                // monotonically, so the pass is O(hr + sessions). `any` semantics are preserved exactly (a
+                // sample inside two overlapping sessions is still counted once), so the logged mean/count
+                // are byte-identical. Int sum can't overflow (≤ STREAM_LIMIT samples × ~255 bpm).
+                val sessions = res.sleepSessions.sortedBy { it.start }
+                var bpmSum = 0
+                var inBedSamples = 0
+                var lo = 0
+                for (s in hr) {
+                    // Drop the leading run of sessions that ended at/before this sample; since HR is
+                    // ascending they can't contain this or any later sample. Only a contiguous prefix is
+                    // dropped, so a later session with an earlier end is simply re-checked below.
+                    while (lo < sessions.size && sessions[lo].end <= s.ts) lo++
+                    var i = lo
+                    while (i < sessions.size && sessions[i].start <= s.ts) {
+                        // start ascending: once start > ts no further session can match (early break).
+                        if (s.ts < sessions[i].end) { bpmSum += s.bpm; inBedSamples++; break }
+                        i++
+                    }
+                }
+                diag(rhrFloorMeanLogLine(day, rhrFloor, bpmSum, inBedSamples))
             }
             scoredNights.add(res)
         }
@@ -1535,10 +1557,18 @@ object IntelligenceEngine {
      * is "nil". Counts/bpm only , no timestamps or PII. Pure so it's unit-tested directly and is the SAME
      * line analyzeRecent ships. Byte-identical to the Swift `rhrFloorMeanLogLine`.
      */
-    internal fun rhrFloorMeanLogLine(day: String, floor: Int, inBedBpms: List<Int>): String {
-        val meanLog = if (inBedBpms.isEmpty()) "nil"
-            else Math.round(inBedBpms.sum().toDouble() / inBedBpms.size).toString()
-        return "rhr day=$day floor=$floor nightMean=$meanLog inBedSamples=${inBedBpms.size} " +
+    internal fun rhrFloorMeanLogLine(day: String, floor: Int, inBedBpms: List<Int>): String =
+        rhrFloorMeanLogLine(day, floor, inBedBpms.sum(), inBedBpms.size)
+
+    /**
+     * Allocation-free overload for the scored-days loop: takes the in-bed bpm [bpmSum] and [sampleCount]
+     * a single pass already accumulated, instead of materializing the matched bpm list. Byte-identical to
+     * the [List] overload (empty span → "nil"; same round-half-up mean).
+     */
+    internal fun rhrFloorMeanLogLine(day: String, floor: Int, bpmSum: Int, sampleCount: Int): String {
+        val meanLog = if (sampleCount == 0) "nil"
+            else Math.round(bpmSum.toDouble() / sampleCount).toString()
+        return "rhr day=$day floor=$floor nightMean=$meanLog inBedSamples=$sampleCount " +
             "(floor = WHOOP-style lowest-sustained = NOOP RHR; mean = sleeping-HR-app number)"
     }
 }

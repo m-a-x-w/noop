@@ -356,9 +356,14 @@ public enum SleepStager {
     /// HR in the interval, the answer is false (cannot vouch for the gap → treat as a real break).
     static func hrSleepBandAcross(_ a: Int, _ b: Int, hr: [HRSample], baseline: Double?) -> Bool {
         guard let baseline = baseline else { return false }
-        let seg = hr.filter { $0.ts > a && $0.ts <= b }
-        if seg.isEmpty { return false }
-        let meanHR = Double(seg.reduce(0) { $0 + $1.bpm }) / Double(seg.count)
+        // `hr` is ts-ascending at every call site (hrS), so (a, b] is a contiguous binary-searched
+        // slice — an O(log n + segment) mean, not a full-array filter + allocation per gravity gap.
+        let lo = upperBoundIndex(hr, a) { $0.ts }   // first ts > a
+        let hi = upperBoundIndex(hr, b) { $0.ts }   // first ts > b
+        if lo >= hi { return false }
+        var sum = 0
+        for i in lo..<hi { sum += hr[i].bpm }
+        let meanHR = Double(sum) / Double(hi - lo)
         return meanHR <= baseline * hrSleepBandMult
     }
 
@@ -493,6 +498,27 @@ public enum SleepStager {
         rows.filter { ts($0) >= start && ts($0) <= end }
     }
 
+    /// First index `i` in a ts-ascending `rows` with `key(rows[i]) >= value` (lower bound), else count.
+    /// O(log n). Callers must pass a ts-sorted array (all hot paths pass the pre-sorted hrS/rrS).
+    static func lowerBoundIndex<T>(_ rows: [T], _ value: Int, key: (T) -> Int) -> Int {
+        var lo = 0, hi = rows.count
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2
+            if key(rows[mid]) < value { lo = mid + 1 } else { hi = mid }
+        }
+        return lo
+    }
+
+    /// First index `i` in a ts-ascending `rows` with `key(rows[i]) > value` (upper bound), else count.
+    static func upperBoundIndex<T>(_ rows: [T], _ value: Int, key: (T) -> Int) -> Int {
+        var lo = 0, hi = rows.count
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2
+            if key(rows[mid]) <= value { lo = mid + 1 } else { hi = mid }
+        }
+        return lo
+    }
+
     /// Day HR baseline = median bpm over all HR samples; nil if none.
     static func hrBaseline(_ hr: [HRSample]) -> Double? {
         let vals = hr.map { Double($0.bpm) }
@@ -602,22 +628,24 @@ public enum SleepStager {
         // that a long gap is anomalous. A WHOOP 4.0 synced night is motion-reconstructed with sparse HR,
         // so its natural gaps must NOT read as off-wrist (that wrongly dropped a real night). Judge over
         // the whole stream so an off-wrist HOLE inside an otherwise dense, worn day (#500) is still caught.
-        let sortedAll = hr.sorted { $0.ts < $1.ts }
-        let streamSpan = sortedAll[sortedAll.count - 1].ts - sortedAll[0].ts
+        // `hr` is ts-ascending at every call site (hrS), so its endpoints are the min/max ts — no sort.
+        let streamSpan = hr[hr.count - 1].ts - hr[0].ts
         if streamSpan >= hrDenseSpacingS && hr.count < streamSpan / hrDenseSpacingS { return [] }
         let gapS = offWristHRGapMin * 60
-        let seg = hr.filter { $0.ts >= p.start && $0.ts <= p.end }.sorted { $0.ts < $1.ts }
+        // In-run samples are the contiguous ts-range [p.start, p.end] of the sorted stream (binary-searched).
+        let lo = lowerBoundIndex(hr, p.start) { $0.ts }
+        let hi = upperBoundIndex(hr, p.end) { $0.ts }
         // No HR anywhere inside a run long enough to matter → the whole period is one gap.
-        if seg.isEmpty { return (p.end - p.start) >= gapS ? [(start: p.start, end: p.end)] : [] }
+        if lo >= hi { return (p.end - p.start) >= gapS ? [(start: p.start, end: p.end)] : [] }
         var spans: [(start: Int, end: Int)] = []
         // Leading edge: run start to first sample.
-        if seg[0].ts - p.start >= gapS { spans.append((start: p.start, end: seg[0].ts)) }
+        if hr[lo].ts - p.start >= gapS { spans.append((start: p.start, end: hr[lo].ts)) }
         // Interior: any gap between consecutive in-run samples.
-        for i in 1..<seg.count where seg[i].ts - seg[i - 1].ts >= gapS {
-            spans.append((start: seg[i - 1].ts, end: seg[i].ts))
+        for i in (lo + 1)..<hi where hr[i].ts - hr[i - 1].ts >= gapS {
+            spans.append((start: hr[i - 1].ts, end: hr[i].ts))
         }
         // Trailing edge: last sample to run end.
-        if p.end - seg[seg.count - 1].ts >= gapS { spans.append((start: seg[seg.count - 1].ts, end: p.end)) }
+        if p.end - hr[hi - 1].ts >= gapS { spans.append((start: hr[hi - 1].ts, end: p.end)) }
         return spans
     }
 
@@ -1885,38 +1913,60 @@ public enum SleepStager {
 
     /// Lowest 5-min rolling-mean HR during the session (bpm), or nil.
     static func sessionRestingHR(start: Int, end: Int, hr: [HRSample]) -> Int? {
-        let seg = hr.filter { $0.ts >= start && $0.ts <= end }
-        guard !seg.isEmpty else { return nil }
+        // `hr` is ts-ascending at every call site (hrS): bucket the [start, end] slice ONCE into 5-min
+        // windows instead of re-filtering the whole segment per window — O(segment), identical output.
+        let lo = lowerBoundIndex(hr, start) { $0.ts }
+        let hi = upperBoundIndex(hr, end) { $0.ts }
+        guard lo < hi else { return nil }
         let windowS = 5 * 60
-        var means: [Double] = []
-        var t = start
-        while t < end {
-            let win = seg.filter { $0.ts >= t && $0.ts < t + windowS }
-            if !win.isEmpty { means.append(Double(win.reduce(0) { $0 + $1.bpm }) / Double(win.count)) }
-            t += windowS
+        // Window count = iterations of the original `while t < end` loop. A sample at ts == end sits in
+        // the segment but in NO window when (end - start) is an exact multiple of windowS, so buckets at
+        // or past this count are dropped from the per-window means — matching the original byte-for-byte.
+        let windowCount = end > start ? (end - start + windowS - 1) / windowS : 0
+        var sums = [Int](repeating: 0, count: windowCount)
+        var counts = [Int](repeating: 0, count: windowCount)
+        var segSum = 0
+        for i in lo..<hi {
+            segSum += hr[i].bpm
+            let bucket = (hr[i].ts - start) / windowS
+            if bucket < windowCount { sums[bucket] += hr[i].bpm; counts[bucket] += 1 }
         }
-        if let m = means.min() { return Int(m.rounded()) }
-        let all = Double(seg.reduce(0) { $0 + $1.bpm }) / Double(seg.count)
+        var minMean: Double? = nil
+        for k in 0..<windowCount where counts[k] > 0 {
+            let m = Double(sums[k]) / Double(counts[k])
+            if minMean == nil || m < minMean! { minMean = m }
+        }
+        if let m = minMean { return Int(m.rounded()) }
+        let all = Double(segSum) / Double(hi - lo)
         return Int(all.rounded())
     }
 
     /// Mean RMSSD over 5-min tumbling windows across the session (ms), or nil.
     /// Uses the same range-filter + ≥2-valid-interval rule as hrv.rmssd().
     static func sessionAvgHRV(start: Int, end: Int, rr: [RRInterval]) -> Double? {
-        let seg = rr.filter { $0.ts >= start && $0.ts <= end }
-        guard !seg.isEmpty else { return nil }
+        // `rr` is ts-ascending at every call site (rrS): bucket the [start, end] slice ONCE into 5-min
+        // windows in a single pass instead of re-filtering per window. Buckets are visited in time order
+        // so the vals[] accumulation (and its float sum) is identical to the original tumbling loop.
+        let lo = lowerBoundIndex(rr, start) { $0.ts }
+        let hi = upperBoundIndex(rr, end) { $0.ts }
+        guard lo < hi else { return nil }
         let windowS = 5 * 60
+        // See sessionRestingHR: a ts == end sample lands past the last window when (end - start) is an
+        // exact multiple of windowS, so buckets at/past this count are dropped — byte-identical membership.
+        let windowCount = end > start ? (end - start + windowS - 1) / windowS : 0
+        var buckets = [[Double]](repeating: [], count: windowCount)
+        for i in lo..<hi {
+            let bucket = (rr[i].ts - start) / windowS
+            if bucket < windowCount { buckets[bucket].append(Double(rr[i].rrMs)) }
+        }
         var vals: [Double] = []
-        var t = start
-        while t < end {
-            let bucket = seg.filter { $0.ts >= t && $0.ts < t + windowS }.map { Double($0.rrMs) }
+        for bucket in buckets {
             // Full clean (range + Malik ectopic rejection), not just range — matches the
             // analyze() pipeline. The 0x2A37 RR on a WHOOP 5/MG is PPG-derived and noisier
             // than a 4.0's; rMSSD is built from SUCCESSIVE differences, so an un-rejected
             // jitter spike inflates the session HRV. Ectopic rejection drops those (#262/#235).
             let cleaned = HRVAnalyzer.cleanRR(bucket)
             if cleaned.count >= 2, let r = HRVAnalyzer.rmssdRaw(cleaned) { vals.append(r) }
-            t += windowS
         }
         guard !vals.isEmpty else { return nil }
         return vals.reduce(0, +) / Double(vals.count)

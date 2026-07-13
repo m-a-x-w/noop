@@ -22,6 +22,11 @@ struct NOOPWatchApp: App {
     @StateObject private var store = WatchScoreStore()
     @StateObject private var liveHR = WatchLiveHR()
 
+    // Drives the foreground pull below: when the user brings the glance forward we ask the phone for its
+    // latest snapshot immediately (only fires if the phone is reachable), so a wrist-raise shows current
+    // scores without waiting on the next phone-side push.
+    @Environment(\.scenePhase) private var scenePhase
+
     init() {
         #if DEBUG
         Self.seedDemoSnapshotIfNeeded()
@@ -36,6 +41,11 @@ struct NOOPWatchApp: App {
                 // The watch app is dark-only to match the Apple-Fitness-x-WHOOP look. StrandPalette
                 // tokens resolve their dark values here, so the rings read on the near-black canvas.
                 .preferredColorScheme(.dark)
+        }
+        // A wrist-raise / open is the moment the user most wants current scores. Pull once on becoming
+        // active; it's a no-op unless the phone is reachable, so it adds no background/battery cost.
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { store.requestLatestSnapshot() }
         }
     }
 

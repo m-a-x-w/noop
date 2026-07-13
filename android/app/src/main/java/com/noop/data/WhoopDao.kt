@@ -232,6 +232,31 @@ interface WhoopDao : DeviceRegistryDao {
     )
     suspend fun hrWindowStats(deviceId: String, from: Long, to: Long): HrWindowStats
 
+    /**
+     * Change-fingerprint of the [hrSamples] read-side UNION (measured `hrSample` ∪ v26 PPG-derived
+     * `ppgHrSample`, same anti-join and same earliest-`:limit` truncation) over [from, to]. Backs the
+     * live-Effort re-mount cache (#402): count / avg / max bpm detect a changed sample set, while
+     * MIN(ts) / MAX(ts) and the second-smallest ts capture the timestamp shape [StrainScorer] reads
+     * (sparse-span gate + first-two-sample duration). Because it aggregates the SAME union the Effort
+     * integration reads, a PPG-only append (`hrSample` unchanged) still moves the fingerprint. One
+     * indexed range scan, no row materialisation. */
+    @Query(
+        "WITH u AS (" +
+            "SELECT ts, bpm FROM (" +
+            "SELECT ts, bpm FROM hrSample " +
+            "WHERE deviceId = :deviceId AND ts >= :from AND ts <= :to " +
+            "UNION ALL " +
+            "SELECT p.ts AS ts, p.bpm AS bpm FROM ppgHrSample p " +
+            "WHERE p.deviceId = :deviceId AND p.ts >= :from AND p.ts <= :to " +
+            "AND NOT EXISTS (SELECT 1 FROM hrSample h WHERE h.deviceId = p.deviceId AND h.ts = p.ts)" +
+            ") ORDER BY ts ASC LIMIT :limit" +
+            ") " +
+            "SELECT COUNT(*) AS n, AVG(bpm) AS avg, MAX(bpm) AS max, MIN(ts) AS minTs, MAX(ts) AS maxTs, " +
+            "(SELECT ts FROM u GROUP BY ts ORDER BY ts ASC LIMIT 1 OFFSET 1) AS ts2 " +
+            "FROM u"
+    )
+    suspend fun hrWindowFingerprint(deviceId: String, from: Long, to: Long, limit: Int): HrWindowFingerprint
+
     @Query(
         "SELECT * FROM rrInterval WHERE deviceId = :deviceId AND ts >= :from AND ts <= :to " +
             "ORDER BY ts ASC, rrMs ASC LIMIT :limit"

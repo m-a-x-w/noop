@@ -65,12 +65,9 @@ struct LiquidTodayView: View {
     @State private var dataLoaded = false
 
     // Custom liquid pull-to-refresh: a vessel that FILLS as you drag, releases into a refresh (replaces
-    // the system spinner). Driven by the scroll's top overscroll offset.
-    @State private var pullY: CGFloat = 0
-    @State private var refreshArmed = false
-    @State private var refreshing = false
-    @State private var pullHaptic = 0
-    private let pullThreshold: CGFloat = 80
+    // the system spinner). Its @State (pull offset / armed / refreshing / haptic) lives entirely in the
+    // LiquidPullRefreshHeader child so a rubber-band drag re-evaluates ONLY that small header, never this
+    // eager 8-section dashboard body (per-frame full-body re-evals were the measured stutter, see above).
 
     /// Mock Vitality purple (#9b7bff) has no exact StrandPalette token in this theme.
     private let liquidPurple = Color(.sRGB, red: 0x9b / 255, green: 0x7b / 255, blue: 0xff / 255, opacity: 1)
@@ -117,8 +114,7 @@ struct LiquidTodayView: View {
         case 0: return "Today"
         case 1: return "Yesterday"
         default:
-            let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "EEEE"
-            return f.string(from: selectedLogicalDay)
+            return Self.weekdayFormatter.string(from: selectedLogicalDay)
         }
     }
     /// Two-way binding for the graphical calendar: reads the shown day, writes back an offset.
@@ -170,19 +166,36 @@ struct LiquidTodayView: View {
         f.dateFormat = "yyyy-MM-dd"
         return f
     }()
+    /// Cached formatters for the header/steps read-outs — building a fresh DateFormatter/NumberFormatter
+    /// on every body pass is expensive; these are stamped once (matches the dayKeyParser pattern above).
+    private static let weekdayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "EEEE"
+        return f
+    }()
+    private static let dateLineFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "EEEE, d MMMM"
+        return f
+    }()
+    private static let stepsFormatter: NumberFormatter = {
+        let f = NumberFormatter()
+        f.numberStyle = .decimal
+        return f
+    }()
 
     var body: some View {
         ScrollView {
             VStack(spacing: 0) {
-                // Scroll-offset probe at the very top (before padding), so its minY in the scroll's
-                // coordinate space reads the top OVERSCROLL: ~0 at rest, positive as you pull down.
-                GeometryReader { g in
-                    Color.clear.preference(key: PullOffsetKey.self,
-                                           value: g.frame(in: .named(Self.pullSpace)).minY)
+                // Pull-to-refresh header: owns the scroll-offset probe, the filling vessel, and the release
+                // haptic, and holds all the per-frame pull @State itself so the drag never re-evaluates this
+                // dashboard body. Reports only the discrete refresh-fire event back via the closure.
+                LiquidPullRefreshHeader(coordinateSpace: Self.pullSpace, heart: liquidHeart) {
+                    await repo.refresh()
+                    await load()
                 }
-                .frame(height: 0)
-
-                liquidRefreshIndicator   // grows in the revealed space; a vessel filling with the pull
 
                 VStack(alignment: .leading, spacing: 12) {
                     scene
@@ -206,7 +219,6 @@ struct LiquidTodayView: View {
             #endif
         }
         .coordinateSpace(name: Self.pullSpace)
-        .onPreferenceChange(PullOffsetKey.self) { handlePull($0) }
         // The sky is a FIXED full-bleed backdrop drawn behind the scroll content, edge-to-edge under the
         // status bar. A ScrollView background does not scroll with the content, so pulling down never
         // moves the sky (the exact behaviour the scaffold uses on the classic Today).
@@ -232,8 +244,6 @@ struct LiquidTodayView: View {
         // A light tick when the day changes (swipe or calendar pick) — the WHOOP-style day nav should
         // feel physical ("every tiny little thing").
         .liquidSelectionHaptic(trigger: selectedDayOffset)
-        // A firm tick when the pull passes the release threshold (the custom liquid refresh).
-        .liquidMediumHaptic(trigger: pullHaptic)
         .task(id: "\(repo.refreshSeq)-\(selectedDayOffset)") { await load() }
         .sheet(item: $guideSection) { section in
             NavigationStack { ScoringGuideView(initialSection: section, onClose: { guideSection = nil }) }
@@ -270,47 +280,6 @@ struct LiquidTodayView: View {
     // MARK: - Liquid pull-to-refresh
 
     static let pullSpace = "liqTodayScroll"
-
-    /// Reserves the revealed space at the top and shows a vessel that fills with the pull, then sloshes
-    /// while the refresh runs.
-    private var liquidRefreshIndicator: some View {
-        let progress = min(1, max(0, pullY / pullThreshold))
-        return ZStack {
-            if refreshing {
-                LiquidVessel(value: 0.6, tint: liquidHeart, animated: true)
-                    .frame(width: 34, height: 34)
-            } else if pullY > 2 {
-                LiquidVessel(value: progress, tint: liquidHeart, animated: false)
-                    .frame(width: 30, height: 30)
-                    .opacity(progress)
-                    .scaleEffect(0.7 + 0.3 * progress)
-            }
-        }
-        .frame(maxWidth: .infinity)
-        .frame(height: refreshing ? 64 : min(pullY, pullThreshold * 1.15))
-        .animation(.easeOut(duration: 0.22), value: refreshing)
-    }
-
-    /// Arm the refresh once the pull passes the threshold; FIRE it when the finger releases (the pull
-    /// springs back toward zero). Guarded so it can't double-fire or re-trigger mid-refresh.
-    private func handlePull(_ y: CGFloat) {
-        pullY = max(0, y)
-        guard !refreshing else { return }
-        if pullY >= pullThreshold, !refreshArmed {
-            refreshArmed = true
-            pullHaptic &+= 1
-        }
-        if refreshArmed, pullY < 6 {
-            refreshArmed = false
-            refreshing = true
-            Task {
-                await repo.refresh()
-                await load()
-                try? await Task.sleep(nanoseconds: 350_000_000)   // let the fill read as "done"
-                withAnimation(.easeOut(duration: 0.25)) { refreshing = false }
-            }
-        }
-    }
 
     // MARK: - Scene (sky title + controls + hero)
 
@@ -929,9 +898,7 @@ struct LiquidTodayView: View {
 
     private var stepsText: String {
         guard let s = stepCount else { return "–" }
-        let f = NumberFormatter()
-        f.numberStyle = .decimal
-        return f.string(from: NSNumber(value: Int(s))) ?? "\(Int(s))"
+        return Self.stepsFormatter.string(from: NSNumber(value: Int(s))) ?? "\(Int(s))"
     }
 
     // The user's Effort display scale (#268), 0–100 by default or the WHOOP 0–21 axis if chosen — the SAME
@@ -956,10 +923,7 @@ struct LiquidTodayView: View {
     }
 
     private var dateLine: String {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "EEEE, d MMMM"
-        return f.string(from: selectedLogicalDay)
+        Self.dateLineFormatter.string(from: selectedLogicalDay)
     }
 
     /// Provenance caption for the recovery-vitals card, keyed on the row a vital actually came from — NOT a
@@ -983,6 +947,85 @@ struct LiquidTodayView: View {
 private struct PullOffsetKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+
+// MARK: - Liquid pull-to-refresh header
+
+/// The custom liquid pull-to-refresh, isolated into its own leaf so a rubber-band drag re-evaluates ONLY
+/// this small header — not the parent's eager 8-section dashboard body (per-frame full-body re-evals were
+/// the measured stutter this screen was tuned against). It owns all the pull @State (offset / armed /
+/// refreshing / haptic), holds the scroll-offset probe and the filling-vessel indicator, and fires the
+/// release haptic itself. The parent hears only the discrete "fire refresh" event via `onRefresh`.
+private struct LiquidPullRefreshHeader: View {
+    /// The scroll's coordinate space, named on the parent ScrollView; the probe reads its top overscroll.
+    let coordinateSpace: String
+    /// The liquid heart pink the parent tints the vessel with (kept identical to the previous inline use).
+    let heart: Color
+    /// Discrete refresh action — the parent passes `{ await repo.refresh(); await load() }`.
+    let onRefresh: () async -> Void
+
+    @State private var pullY: CGFloat = 0
+    @State private var refreshArmed = false
+    @State private var refreshing = false
+    @State private var pullHaptic = 0
+    private let pullThreshold: CGFloat = 80
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Scroll-offset probe at the very top (before padding), so its minY in the scroll's coordinate
+            // space reads the top OVERSCROLL: ~0 at rest, positive as you pull down.
+            GeometryReader { g in
+                Color.clear.preference(key: PullOffsetKey.self,
+                                       value: g.frame(in: .named(coordinateSpace)).minY)
+            }
+            .frame(height: 0)
+
+            indicator   // grows in the revealed space; a vessel filling with the pull
+        }
+        .onPreferenceChange(PullOffsetKey.self) { handlePull($0) }
+        // A firm tick when the pull passes the release threshold (the custom liquid refresh).
+        .liquidMediumHaptic(trigger: pullHaptic)
+    }
+
+    /// Reserves the revealed space at the top and shows a vessel that fills with the pull, then sloshes
+    /// while the refresh runs.
+    private var indicator: some View {
+        let progress = min(1, max(0, pullY / pullThreshold))
+        return ZStack {
+            if refreshing {
+                LiquidVessel(value: 0.6, tint: heart, animated: true)
+                    .frame(width: 34, height: 34)
+            } else if pullY > 2 {
+                LiquidVessel(value: progress, tint: heart, animated: false)
+                    .frame(width: 30, height: 30)
+                    .opacity(progress)
+                    .scaleEffect(0.7 + 0.3 * progress)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: refreshing ? 64 : min(pullY, pullThreshold * 1.15))
+        .animation(.easeOut(duration: 0.22), value: refreshing)
+    }
+
+    /// Arm the refresh once the pull passes the threshold; FIRE it when the finger releases (the pull
+    /// springs back toward zero). Guarded so it can't double-fire or re-trigger mid-refresh.
+    private func handlePull(_ y: CGFloat) {
+        pullY = max(0, y)
+        guard !refreshing else { return }
+        if pullY >= pullThreshold, !refreshArmed {
+            refreshArmed = true
+            pullHaptic &+= 1
+        }
+        if refreshArmed, pullY < 6 {
+            refreshArmed = false
+            refreshing = true
+            Task {
+                await onRefresh()
+                try? await Task.sleep(nanoseconds: 350_000_000)   // let the fill read as "done"
+                withAnimation(.easeOut(duration: 0.25)) { refreshing = false }
+            }
+        }
+    }
 }
 
 // MARK: - NOOP wordmark (centred, with a tap easter egg)

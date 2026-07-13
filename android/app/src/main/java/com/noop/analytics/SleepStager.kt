@@ -2126,14 +2126,27 @@ object SleepStager {
         val seg = hr.filter { it.ts in start..end }
         if (seg.isEmpty()) return null
         val windowS = 5 * 60L
-        val means = ArrayList<Double>()
-        var t = start
-        while (t < end) {
-            val win = seg.filter { it.ts >= t && it.ts < t + windowS }
-            if (win.isNotEmpty()) means.add(win.sumOf { it.bpm }.toDouble() / win.size.toDouble())
-            t += windowS
+        // Bucket each sample into its 5-min window in one pass instead of re-filtering seg per
+        // window (O(n) vs O(n·windows)). numWindows matches the old `while (t < end)` iteration
+        // count; a ts == end sample lands at k == numWindows and is skipped, exactly as the old
+        // `it.ts < t + windowS` bound excluded it when (end - start) is a multiple of windowS.
+        val numWindows = if (end > start) ((end - start - 1) / windowS + 1).toInt() else 0
+        val sums = LongArray(numWindows)
+        val counts = IntArray(numWindows)
+        for (s in seg) {
+            val k = ((s.ts - start) / windowS).toInt()
+            if (k in 0 until numWindows) {
+                sums[k] += s.bpm.toLong()
+                counts[k] += 1
+            }
         }
-        val m = means.minOrNull()
+        var m: Double? = null
+        for (i in 0 until numWindows) {
+            if (counts[i] > 0) {
+                val mean = sums[i].toDouble() / counts[i].toDouble()
+                if (m == null || mean < m) m = mean
+            }
+        }
         if (m != null) return m.roundToInt()
         val all = seg.sumOf { it.bpm }.toDouble() / seg.size.toDouble()
         return all.roundToInt()
@@ -2147,10 +2160,17 @@ object SleepStager {
         val seg = rr.filter { it.ts in start..end }
         if (seg.isEmpty()) return null
         val windowS = 5 * 60L
+        // Bucket each interval into its 5-min window in one pass instead of re-filtering seg per
+        // window (O(n) vs O(n·windows)). numWindows and the ts == end skip mirror sessionRestingHR;
+        // within-bucket order matches seg iteration order, so cleanRR/rmssdRaw see identical input.
+        val numWindows = if (end > start) ((end - start - 1) / windowS + 1).toInt() else 0
+        val buckets = Array(numWindows) { ArrayList<Double>() }
+        for (s in seg) {
+            val k = ((s.ts - start) / windowS).toInt()
+            if (k in 0 until numWindows) buckets[k].add(s.rrMs.toDouble())
+        }
         val vals = ArrayList<Double>()
-        var t = start
-        while (t < end) {
-            val bucket = seg.filter { it.ts >= t && it.ts < t + windowS }.map { it.rrMs.toDouble() }
+        for (bucket in buckets) {
             // Full clean (range + Malik ectopic rejection), not just range — matches the
             // analyze() pipeline. The 0x2A37 RR on a WHOOP 5/MG is PPG-derived and noisier
             // than a 4.0's; rMSSD is built from SUCCESSIVE differences, so an un-rejected
@@ -2160,7 +2180,6 @@ object SleepStager {
                 val r = HrvAnalyzer.rmssdRaw(cleaned)
                 if (r != null) vals.add(r)
             }
-            t += windowS
         }
         if (vals.isEmpty()) return null
         return vals.sum() / vals.size.toDouble()

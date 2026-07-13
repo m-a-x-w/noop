@@ -63,7 +63,28 @@ public enum WatchRecovery {
         // exactly as the strap path does. SDNN feeds the HRV config; resting HR feeds the RHR config.
         let hrvBase = Baselines.foldHistory(sdnnHistory.map { Optional($0) }, cfg: Baselines.hrvCfg)
         let rhrBase = Baselines.foldHistory(rhrHistory.map { Optional($0) }, cfg: Baselines.restingHRCfg)
+        // Delegate to the pre-folded overload. `sdnnHistory.count` is the honesty gate's night count
+        // (the caller already compact-mapped the nils out), so it carries through verbatim.
+        return compute(todaySDNN: todaySDNN, todayRHR: todayRHR,
+                       hrvBaseline: hrvBase, rhrBaseline: rhrBase, sdnnNights: sdnnHistory.count)
+    }
 
+    /// Incremental sibling of `compute(todaySDNN:todayRHR:sdnnHistory:rhrHistory:)` that takes the
+    /// SDNN/RHR baselines ALREADY folded (plus the SDNN night count that drives the `minBaselineNights`
+    /// honesty gate) instead of re-folding the whole trailing history on every call. Behaviourally
+    /// identical to the history overload — that one now delegates here after folding — but lets a caller
+    /// scanning a chronological series carry running `Baselines.update` state and pay O(n) total instead
+    /// of re-folding O(i) history per row (see `IntelligenceEngine.watchRecoveries`). The history-based
+    /// signature above stays the public, unit-tested entry point.
+    ///
+    /// - Parameters:
+    ///   - hrvBaseline: the SDNN baseline folded over the trailing history (oldest → newest).
+    ///   - rhrBaseline: the resting-HR baseline folded over the trailing history.
+    ///   - sdnnNights: number of SDNN readings that fed `hrvBaseline` (the pre-fold history count,
+    ///     matching `sdnnHistory.count`), used verbatim for the `minBaselineNights` gate.
+    public static func compute(todaySDNN: Double?, todayRHR: Int?,
+                               hrvBaseline hrvBase: BaselineState, rhrBaseline rhrBase: BaselineState,
+                               sdnnNights: Int) -> Result {
         // Confidence is the SAME helper the strap Charge uses, so the calibrating → building → solid
         // arc matches. It reads .calibrating whenever recovery would be nil (no usable HRV baseline),
         // and below it we ALSO nil-out recovery, so the two stay consistent.
@@ -73,7 +94,7 @@ public enum WatchRecovery {
         // week of nights. Any miss → nil recovery + calibrating, never a fabricated value.
         guard let sdnn = todaySDNN,
               hrvBase.usable,
-              sdnnHistory.count >= minBaselineNights else {
+              sdnnNights >= minBaselineNights else {
             return Result(recovery: nil, confidence: .calibrating)
         }
 

@@ -34,6 +34,7 @@ import com.noop.ble.WhoopModel
 import androidx.health.connect.client.HealthConnectClient
 import com.noop.data.DailyMetric
 import com.noop.data.HrSample
+import com.noop.data.SleepSession
 import com.noop.data.WhoopRepository
 import com.noop.data.WorkoutRow
 import com.noop.ingest.HealthConnectImporter
@@ -56,6 +57,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
@@ -476,6 +478,43 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var todayStressCache: Double? = null
     var todayFitnessAgeCache: Double? = null
     var todayVitalityCache: Double? = null
+
+    /**
+     * #402 live-Effort re-mount guard. The live Effort integration re-reads the WHOLE local-midnight→now raw
+     * HR window (up to ~86k rows late in the day) and re-runs StrainScorer on every tab-return re-mount and
+     * every `days` re-emission, even when no new HR landed since. This holds the last integration's CHEAP
+     * HR-window watermark (day + per-union-source count/avg/max, one indexed aggregate each) and the Effort
+     * it produced, so the screen reuses the cached number when the watermark is unchanged instead of
+     * re-reading + re-integrating the raw series. A bare `days` signature (like the footer's above) is
+     * insufficient here: the HR series grows independently of `days`. `null` = not yet computed this process;
+     * lives on the long-lived ViewModel so it SURVIVES the re-mount that resets the screen's local state.
+     */
+    var liveTodayStrainSig: String? = null
+    var liveTodayStrainCache: Double? = null
+
+    /**
+     * #849 twin for the Sleep tab. SleepScreen runs three history-wide `LaunchedEffect(days)` loads — the
+     * un-deduplicated sleep union (every imported + computed session ever, re-keyed by local wake-day and
+     * sorted), the four imported sleep_* metric series (each read over the whole `"0000-00-00".."9999-99-99"`
+     * span), and the learned habitual midsleep — and every one re-fires on each tab-return re-mount and each
+     * `days` re-emission (any daily-metric write, a sync chunk during backfill, an import), even when the data
+     * is unchanged. These signatures + caches live on the long-lived ViewModel (like the Today guards above),
+     * so a re-mount RESTORES the last result and the screen skips the redundant reload when `days` is
+     * content-identical. Each effect carries its own signature (mirroring the footer/cards split), and the
+     * screen seeds its local state from these caches on first composition so a re-mount never flashes empty.
+     * The optimistic bed/wake edit, delete, undo and add-nap paths rewrite the sleep list WITHOUT changing
+     * `days`, so they write the new list straight back into [sleepScreenSleepsCache] (the signature is
+     * unchanged) — otherwise a re-mount would restore the stale pre-edit list. `null` = not loaded this
+     * process. Pure load-bookkeeping; never drives UI.
+     */
+    var sleepScreenSleepsSig: Int? = null
+    var sleepScreenSleepsCache: List<SleepSession>? = null
+    var sleepScreenImportedSig: Int? = null
+    // internal: ImportedSleepSeries is an internal type; the cache holder is only read by the same-module
+    // SleepScreen, so keep the property internal rather than widening the data class's visibility.
+    internal var sleepScreenImportedCache: ImportedSleepSeries? = null
+    var sleepScreenHabitualSig: Int? = null
+    var sleepScreenHabitualCache: Long? = null
 
     /**
      * Recent daily metrics (newest last), backing the Today grid + illness watch.
@@ -913,8 +952,69 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val peakHr: Int = 0,
     )
 
+    /**
+     * O(1)-per-sample accumulator for the active workout's running stats. [captureWorkoutSample] used
+     * to re-fold the WHOLE HR window on every ~1 Hz sample — sumOf/maxOf plus a full StrainScorer.strain
+     * recompute — which is O(n) per sample and O(n²) over a long session, all on the main thread while
+     * the Live overlay animates. This keeps sum / peak / Edwards zone-weight as running totals instead.
+     *
+     * [liveStrain] mirrors [StrainScorer.strain] for the EDWARDS method with the default resting HR and
+     * denominator (the exact call the per-sample path made), reusing StrainScorer's own public constants
+     * and [StrainScorer.zoneWeight]/[StrainScorer.trimpToStrain], so the value is byte-identical. The
+     * accumulator is keyed by [startMs] + [maxHR]; whenever either changes (a new session, a rehydrated
+     * snapshot, or an edited HRmax) the caller rebuilds it from the full sample list, which keeps the
+     * result identical to a from-scratch recompute even when HRmax moves mid-session.
+     */
+    private class WorkoutStats(val startMs: Long, val maxHR: Double) {
+        private val restingHR = StrainScorer.defaultRestingHR
+        private val hrReserve = maxHR - restingHR
+        private var count = 0
+        private var bpmSum = 0L
+        private var peak = 0
+        private var weighted = 0        // Edwards zone-weight running sum (matches StrainScorer.edwardsTRIMP)
+        private var firstTs = 0L        // insertion order [0]/[1] → per-sample duration
+        private var secondTs = 0L
+        private var minTs = 0L          // ts span → sparse-stream enoughData gate (#482)
+        private var maxTs = 0L
+
+        fun add(bpm: Int, ts: Long) {
+            when (count) {
+                0 -> { firstTs = ts; minTs = ts; maxTs = ts }
+                1 -> { secondTs = ts; if (ts < minTs) minTs = ts; if (ts > maxTs) maxTs = ts }
+                else -> { if (ts < minTs) minTs = ts; if (ts > maxTs) maxTs = ts }
+            }
+            count++
+            bpmSum += bpm
+            if (bpm > peak) peak = bpm
+            weighted += StrainScorer.zoneWeight(bpm.toDouble(), restingHR, hrReserve)
+        }
+
+        val avgHr: Int get() = if (count > 0) (bpmSum / count).toInt() else 0
+        val peakHr: Int get() = peak
+
+        /** Live Effort (0–100), identical to StrainScorer.strain(samples, maxHR, method = EDWARDS). */
+        fun liveStrain(): Double {
+            val enoughData = when {
+                count >= StrainScorer.minReadings -> true
+                count >= StrainScorer.minSparseReadings -> (maxTs - minTs) >= StrainScorer.minSpanSeconds
+                else -> false
+            }
+            if (!enoughData || maxHR <= restingHR) return 0.0
+            val sampleDur = if (count < 2) {
+                StrainScorer.fallbackSampleMin
+            } else {
+                val deltaS = abs((secondTs - firstTs).toDouble())
+                if (deltaS > 0) deltaS / 60.0 else StrainScorer.fallbackSampleMin
+            }
+            return StrainScorer.trimpToStrain(weighted.toDouble() * sampleDur)
+        }
+    }
+
     private val _activeWorkout = MutableStateFlow<ActiveWorkout?>(null)
     val activeWorkout: StateFlow<ActiveWorkout?> = _activeWorkout.asStateFlow()
+    /** Running stats for the in-flight workout; rebuilt lazily by [captureWorkoutSample] when it goes
+     *  out of sync with [_activeWorkout] (new session, rehydrated snapshot, or an edited HRmax). */
+    private var workoutStats: WorkoutStats? = null
     private val _lastWorkout = MutableStateFlow<WorkoutRow?>(null)
     val lastWorkout: StateFlow<WorkoutRow?> = _lastWorkout.asStateFlow()
 
@@ -1060,6 +1160,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun endWorkout() {
         val w = _activeWorkout.value ?: return
         _activeWorkout.value = null
+        workoutStats = null
         gpsJob?.cancel(); gpsJob = null
         // Drop the durable non-GPS snapshot the instant the session ends — whether it saves below or is
         // discarded as too-short — so a relaunch never rehydrates an already-finished session (#529).
@@ -1145,10 +1246,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // never null. (Fixes the NPE in @maddognik's ADB: captureWorkoutSample -> getValue on null.)
         @Suppress("UNNECESSARY_SAFE_CALL")
         val w = _activeWorkout?.value ?: return
-        val s = w.samples + HrSample(deviceId = deviceId, ts = System.currentTimeMillis() / 1000, bpm = bpm)
-        val strain = StrainScorer.strain(s, maxHR = profileStore.hrMax.toDouble(), sex = profileStore.sex) ?: 0.0
+        // Keep running sum/peak/Edwards-TRIMP instead of re-folding the whole HR window per sample.
+        // Rebuild from the current samples if the accumulator is stale (new session / rehydrated snapshot)
+        // or if HRmax changed under us (which shifts every sample's HRR zone) so liveStrain stays exact.
+        val hrMax = profileStore.hrMax.toDouble()
+        var stats = workoutStats
+        if (stats == null || stats.startMs != w.startMs || stats.maxHR != hrMax) {
+            stats = WorkoutStats(startMs = w.startMs, maxHR = hrMax)
+            for (prior in w.samples) stats.add(prior.bpm, prior.ts)
+            workoutStats = stats
+        }
+        val sample = HrSample(deviceId = deviceId, ts = System.currentTimeMillis() / 1000, bpm = bpm)
+        stats.add(sample.bpm, sample.ts)
+        val s = w.samples + sample
         val updated = w.copy(
-            samples = s, avgHr = s.sumOf { it.bpm } / s.size, peakHr = s.maxOf { it.bpm }, liveStrain = strain,
+            samples = s, avgHr = stats.avgHr, peakHr = stats.peakHr, liveStrain = stats.liveStrain(),
         )
         _activeWorkout.value = updated
         // Re-snapshot the durable non-GPS session so a process kill keeps the latest accumulated HR (#529).
