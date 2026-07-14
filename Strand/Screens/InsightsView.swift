@@ -1220,16 +1220,26 @@ struct InsightsView: View {
         let title: String        // "Sleep → Recovery"
         let blurb: String        // what the pairing probes
         let corr: Correlation
+        /// Benjamini–Hochberg FDR-adjusted q-value, computed across the whole curated
+        /// family in computeRelationships. The significance pill reads this, not the
+        /// raw per-pair `corr.pApprox`, so it accounts for how many pairs we tested.
+        let pAdjusted: Double
     }
 
     private func computeRelationships() -> [Relationship] {
         func series(_ key: String) -> [(day: String, value: Double)] { seriesByKey[key] ?? [] }
-        var out: [Relationship] = []
+
+        // Collect the curated pairings first, THEN apply one family-level Benjamini–
+        // Hochberg FDR correction across all of their raw per-pair p-values, so the
+        // significance pill reads an adjusted q-value rather than a bare p that ignores
+        // how many relationships we tested at once.
+        typealias Pairing = (id: String, title: String, blurb: String, corr: Correlation)
+        var pairings: [Pairing] = []
 
         // Sleep performance ↔ recovery (same day).
         if let c = CorrelationEngine.pearson(
             CorrelationEngine.alignByDay(series("sleep_performance"), series("recovery"))) {
-            out.append(.init(id: "sleep-rec",
+            pairings.append((id: "sleep-rec",
                              title: String(localized: "Rest ↔ Charge"),
                              blurb: String(localized: "How closely a good night tracks next-morning charge."),
                              corr: c))
@@ -1237,7 +1247,7 @@ struct InsightsView: View {
         // HRV ↔ recovery (same day).
         if let c = CorrelationEngine.pearson(
             CorrelationEngine.alignByDay(series("hrv"), series("recovery"))) {
-            out.append(.init(id: "hrv-rec",
+            pairings.append((id: "hrv-rec",
                              title: String(localized: "HRV ↔ Charge"),
                              blurb: String(localized: "Heart-rate variability as the engine behind your charge score."),
                              corr: c))
@@ -1245,7 +1255,7 @@ struct InsightsView: View {
         // Resting HR ↔ recovery (same day), expected to be negative.
         if let c = CorrelationEngine.pearson(
             CorrelationEngine.alignByDay(series("rhr"), series("recovery"))) {
-            out.append(.init(id: "rhr-rec",
+            pairings.append((id: "rhr-rec",
                              title: String(localized: "Resting HR ↔ Charge"),
                              blurb: String(localized: "A lower resting heart rate usually means a higher charge."),
                              corr: c))
@@ -1254,13 +1264,18 @@ struct InsightsView: View {
         // (Strain series isn't in the outcome set; recovery→next-day recovery shows
         //  how much yesterday carries into today.)
         if let c = CorrelationEngine.lagged(x: series("recovery"), y: series("recovery"), lagDays: 1) {
-            out.append(.init(id: "rec-lag",
+            pairings.append((id: "rec-lag",
                              title: String(localized: "Charge → Next-day charge"),
                              blurb: String(localized: "How much one day's charge carries into the next."),
                              corr: c))
         }
 
-        return out
+        // One BH pass over the whole family, then zip the q-values back in order.
+        let adjusted = CorrelationEngine.benjaminiHochberg(pairings.map { $0.corr.pApprox })
+        return zip(pairings, adjusted).map { pairing, q in
+            Relationship(id: pairing.id, title: pairing.title, blurb: pairing.blurb,
+                         corr: pairing.corr, pAdjusted: q)
+        }
     }
 
     private func relationshipRow(_ rel: Relationship) -> some View {
@@ -1284,8 +1299,8 @@ struct InsightsView: View {
                 Text(String(format: "r = %+.2f", r))
                     .font(StrandFont.number(16))
                     .foregroundStyle(strength)
-                StatePill(rel.corr.pApprox < 0.05 ? "p < 0.05" : "n.s.",
-                          tone: rel.corr.pApprox < 0.05 ? .accent : .neutral,
+                StatePill(rel.pAdjusted < 0.05 ? "q < 0.05" : "n.s.",
+                          tone: rel.pAdjusted < 0.05 ? .accent : .neutral,
                           showsDot: false)
             }
 

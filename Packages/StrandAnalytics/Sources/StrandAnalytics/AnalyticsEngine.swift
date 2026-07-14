@@ -370,6 +370,7 @@ public enum AnalyticsEngine {
         var deepS = 0.0, remS = 0.0, lightS = 0.0, tstS = 0.0
         var inBedS = 0.0, effWeighted = 0.0
         var disturbances = 0
+        var wasoS = 0.0                           // wake-after-sleep-onset (s); ADDITIVE across fragments
         for s in mainGroup {
             let m = SleepStager.hypnogramMetrics(s)
             let inBed = Double(s.end - s.start)
@@ -380,7 +381,15 @@ public enum AnalyticsEngine {
             lightS += m.lightMin * 60.0
             tstS += m.tstS
             disturbances += m.disturbances
+            wasoS += m.wasoS                       // WASO sums over the group (each fragment's own WASO)
         }
+        // SOL (sleep-onset latency) and REM latency are NOT summable across bridged fragments — they are
+        // properties of the night's ONSET, so take them from the FIRST fragment only (nil for an empty
+        // group). remLatencyS is Double.nan on a no-REM night; the DailyMetric build maps that NaN → nil so
+        // it never poisons the stored REAL column or a downstream mean().
+        let firstM = mainGroup.first.map { SleepStager.hypnogramMetrics($0) }
+        let solS = firstM?.solS
+        let remLatencyS = firstM?.remLatencyS
         // OUT-OF-BED time BETWEEN bridged fragments is AWAKE (#777/#705): a main night bridged from two
         // fragments split by a 20-min wake gap was reporting that gap as nowhere (it is in no fragment's
         // [start,end) span), so 20+ min of real awake read as ~4 min - a v7.1 regression, multi-reporter.
@@ -392,6 +401,7 @@ public enum AnalyticsEngine {
         if gapAwakeS > 0 {
             inBedS += gapAwakeS              // the gap is fully awake: extends in-bed, adds 0 to effWeighted
             disturbances += 1
+            wasoS += gapAwakeS              // the inter-fragment awake gap IS WASO (mirrors disturbances += 1)
         }
         let efficiency = inBedS > 0 ? effWeighted / inBedS : 0.0
 
@@ -408,7 +418,8 @@ public enum AnalyticsEngine {
             restorativeSeconds: deepS + remS,
             needHours: sleepNeedHours,
             consistency: sleepConsistency,
-            deepSeconds: deepS)
+            deepSeconds: deepS,
+            ageYears: profile.age > 0 ? profile.age : nil)
         // Sleep & Rest test mode (E5): emit the Rest sub-score breakdown for this night, reusing the
         // IDENTICAL inputs `restScore` consumed above so the trace can never disagree with the score.
         // `subScoreLine` itself reuses `Rest.composite` for the final value. Side-effect-only; emitted
@@ -418,7 +429,8 @@ public enum AnalyticsEngine {
                 tstSeconds: tstS, inBedSeconds: inBedS, efficiency: efficiency,
                 restorativeSeconds: deepS + remS, needHours: sleepNeedHours,
                 consistency: sleepConsistency, deepSeconds: deepS,
-                groupFragments: mainGroup.count, groupInBedSeconds: inBedS))
+                groupFragments: mainGroup.count, groupInBedSeconds: inBedS,
+                ageYears: profile.age > 0 ? profile.age : nil))
             // CAPTURE-C (#799): append the sleep PROVENANCE so an imported row winning the merge is visible
             // (not silently swapped for the measured night). hoursAsleep = the scored night's tst in minutes;
             // sourceRowId = the main-night's start ts for the measured path (stable per night), else the
@@ -601,7 +613,13 @@ public enum AnalyticsEngine {
             skinTempDevC: skinTempDevC,
             respRateBpm: respRateDaily,
             steps: stepsTotal,
-            activeKcalEst: activeKcalEst)
+            activeKcalEst: activeKcalEst,
+            // v23 sleep-architecture latencies (MINUTES). nil when no matched sleep; SOL/REM-latency come
+            // from the main-night's FIRST fragment, WASO is the group sum (+ inter-fragment gap). REM
+            // latency's NaN (no-REM night) maps to nil so it never poisons the REAL column or a mean().
+            solMin: matched.isEmpty ? nil : solS.map { $0 / 60.0 },
+            remLatencyMin: matched.isEmpty ? nil : remLatencyS.flatMap { $0.isNaN ? nil : $0 / 60.0 },
+            wasoMin: matched.isEmpty ? nil : wasoS / 60.0)
         _ = sleepStart; _ = sleepEnd  // available for callers wiring sleep_start/end columns
 
         // ── Cache rows ────────────────────────────────────────────────────────
@@ -611,7 +629,8 @@ public enum AnalyticsEngine {
                 efficiency: s.efficiency,
                 restingHr: s.restingHR,
                 avgHrv: s.avgHRV,
-                stagesJSON: encodeStages(s.stages))
+                stagesJSON: encodeStages(s.stages),
+                lowConfidence: s.lowConfidence)
         }
 
         // ── Per-session per-epoch motion (H8) ─────────────────────────────────
@@ -698,6 +717,48 @@ public enum AnalyticsEngine {
         /// Neutral consistency when the caller supplies no regularity signal.
         public static let neutralConsistency: Double = 0.5
 
+        // ── Age-aware sleep-architecture targets ──────────────────────────────────────────────────────
+        // Deep + REM share of sleep naturally DECLINES with age, so scoring an older adult against the
+        // young-adult targets (restorativeTarget 0.50 / deepShareTarget 0.13) unfairly caps their Rest.
+        // `restorativeTarget(ageYears:)` / `deepShareTarget(ageYears:)` taper each target GENTLY above a
+        // reference age down to a documented floor. `ageYears == nil` (unknown age) pins every target to
+        // the young-adult constant BYTE-FOR-BYTE, so a nil-age caller is identical to the pre-age scoring.
+        /// Reference age (years) at/below which each age-aware target equals its young-adult constant.
+        public static let ageReferenceYears: Double = 40.0
+        /// Age (years) at/above which each age-aware target sits at its documented floor. Between the
+        /// reference and this the target interpolates linearly (monotonic, non-increasing).
+        public static let ageFloorYears: Double = 70.0
+        /// `restorativeTarget` floor at age ≥ `ageFloorYears` (70): the deep+REM "full marks" share tapers
+        /// from 0.50 at age ≤ 40 to this by age 70.
+        public static let restorativeTargetFloor: Double = 0.42
+        /// `deepShareTarget` floor at age ≥ `ageFloorYears` (70): the deep-adequacy target tapers from 0.13
+        /// at age ≤ 40 to this by age 70 (an older adult earns full deep credit at a lower share).
+        public static let deepShareTargetFloor: Double = 0.10
+
+        /// Linear age taper: `young` at/below `ageReferenceYears`, `old` at/above `ageFloorYears`, linearly
+        /// interpolated between. Monotonic NON-increasing (callers pass `young >= old`). `nil` age ⇒ `young`
+        /// verbatim, so the target is byte-identical to the pre-age constant. Kept dependency-free +
+        /// constant-explicit so the Kotlin RestScorer mirror is byte-identical.
+        static func ageTaper(_ ageYears: Double?, young: Double, old: Double) -> Double {
+            guard let age = ageYears else { return young }
+            if age <= ageReferenceYears { return young }
+            if age >= ageFloorYears { return old }
+            let t = (age - ageReferenceYears) / (ageFloorYears - ageReferenceYears)
+            return young + (old - young) * t
+        }
+
+        /// Age-aware "full marks" restorative (deep+REM) share of asleep time. `nil` ⇒ `restorativeTarget`
+        /// (0.50) byte-for-byte; tapers to `restorativeTargetFloor` (0.42) by age 70.
+        public static func restorativeTarget(ageYears: Double?) -> Double {
+            ageTaper(ageYears, young: restorativeTarget, old: restorativeTargetFloor)
+        }
+
+        /// Age-aware deep-sleep share of asleep time that earns FULL restorative credit. `nil` ⇒
+        /// `deepShareTarget` (0.13) byte-for-byte; tapers to `deepShareTargetFloor` (0.10) by age 70.
+        public static func deepShareTarget(ageYears: Double?) -> Double {
+            ageTaper(ageYears, young: deepShareTarget, old: deepShareTargetFloor)
+        }
+
         public static let wDuration: Double = 0.50
         public static let wEfficiency: Double = 0.20
         public static let wRestorative: Double = 0.20
@@ -712,21 +773,25 @@ public enum AnalyticsEngine {
                                      restorativeSeconds: Double,
                                      needHours: Double,
                                      consistency: Double?,
-                                     deepSeconds: Double? = nil) -> Double {
+                                     deepSeconds: Double? = nil,
+                                     ageYears: Double? = nil) -> Double {
             func clamp01(_ x: Double) -> Double { max(0.0, min(1.0, x)) }
 
             let needSeconds = max(needHours, 0.1) * 3600.0
             let durationScore = clamp01(tstSeconds / needSeconds)
             let efficiencyScore = clamp01(efficiency)
+            // Age-aware architecture targets: nil age ⇒ the young-adult constants (0.13 / 0.50) byte-for-byte.
+            let deepTarget = deepShareTarget(ageYears: ageYears)
+            let restTarget = restorativeTarget(ageYears: ageYears)
             // Deep-adequacy factor in [deepFloorFactor, 1]: 1.0 once deep ≥ target share, ramping
             // down to the floor as deep → 0. nil deep (unknown split) ⇒ 1.0 (no adjustment).
             let deepFactor: Double = {
-                guard let deep = deepSeconds, tstSeconds > 0, deepShareTarget > 0 else { return 1.0 }
-                let adequacy = clamp01((deep / tstSeconds) / deepShareTarget)
+                guard let deep = deepSeconds, tstSeconds > 0, deepTarget > 0 else { return 1.0 }
+                let adequacy = clamp01((deep / tstSeconds) / deepTarget)
                 return deepFloorFactor + (1.0 - deepFloorFactor) * adequacy
             }()
             let restorativeScore = tstSeconds > 0
-                ? clamp01((restorativeSeconds / tstSeconds) / restorativeTarget) * deepFactor
+                ? clamp01((restorativeSeconds / tstSeconds) / restTarget) * deepFactor
                 : 0.0
             let consistencyScore = clamp01(consistency ?? neutralConsistency)
 
@@ -743,7 +808,7 @@ public enum AnalyticsEngine {
         /// Single source of truth so the persisted `sleep_performance` series and the Charge
         /// "Rest quality" term agree. `consistency` is the caller's regularity signal (nil → neutral).
         public static func composite(daily d: DailyMetric, needHours: Double = defaultNeedHours,
-                                     consistency: Double? = nil) -> Double? {
+                                     consistency: Double? = nil, ageYears: Double? = nil) -> Double? {
             guard let tstMin = d.totalSleepMin, tstMin > 0, let eff = d.efficiency else { return nil }
             let tstSec = tstMin * 60.0
             let deepSec = (d.deepMin ?? 0) * 60.0
@@ -751,7 +816,7 @@ public enum AnalyticsEngine {
             return composite(tstSeconds: tstSec, inBedSeconds: tstSec / max(eff, 0.01),
                              efficiency: eff, restorativeSeconds: restorativeSec,
                              needHours: needHours, consistency: consistency,
-                             deepSeconds: deepSec)
+                             deepSeconds: deepSec, ageYears: ageYears)
         }
     }
 

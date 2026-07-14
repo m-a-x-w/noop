@@ -136,11 +136,15 @@ struct SleepView: View {
                         if let sleepUndo { sleepUndoBanner(sleepUndo) }
                         restHero(resolved).staggeredAppear(index: 0)
                         SleepMarkCard().staggeredAppear(index: 1)
-                        hero(resolved).staggeredAppear(index: 2)
-                        metricGrid(resolved).staggeredAppear(index: 3)
-                        sleepDebtLedger(resolved).staggeredAppear(index: 4)
-                        stagesVsTypical(resolved).staggeredAppear(index: 5)
-                        durationTrend(resolved).staggeredAppear(index: 6)
+                        // Item 6 — the evening wind-down target sits with the other evening-action card
+                        // (Sleep marks), a forward-looking companion to last night's read. Inserting it
+                        // here bumps every subsequent section's staggeredAppear index by one.
+                        windDownCard().staggeredAppear(index: 2)
+                        hero(resolved).staggeredAppear(index: 3)
+                        metricGrid(resolved).staggeredAppear(index: 4)
+                        sleepDebtLedger(resolved).staggeredAppear(index: 5)
+                        stagesVsTypical(resolved).staggeredAppear(index: 6)
+                        durationTrend(resolved).staggeredAppear(index: 7)
                     }
                 } else {
                     emptyState
@@ -407,6 +411,9 @@ struct SleepView: View {
                     .accessibilityElement(children: .combine)
                 }
                 SourceBadge(score != nil ? sleepScoreSource(model) : "On-device", tint: StrandPalette.restColor)
+                // Item 5 — the "got X of Y needed" bar: last night's asleep time against the personal
+                // need, as the NOOP PipBar with its own on-device-estimate badge.
+                restHeroNeedBar(model.night)
             }
             .padding(NoopMetrics.cardInnerPadding + NoopMetrics.space1)
             .frame(maxWidth: .infinity)
@@ -432,6 +439,56 @@ struct SleepView: View {
             return "Whoop"
         }
         return "On-device"
+    }
+
+    /// Item 5 — the hero's "got X of Y needed" bar: last night's asleep time (`night.stages.asleep`)
+    /// against the personal sleep need, drawn as the NOOP `PipBar` with a plain-English read and an
+    /// on-device-estimate badge. The asleep total and the fallback need are both derived on-device, so
+    /// it's honestly badged. Uses the SAME `sleepNeedMin` the debt ledger and Hours-vs-Needed tile use
+    /// (unchanged by this work), preferring the imported per-day WHOOP need when the export carried one.
+    @ViewBuilder
+    private func restHeroNeedBar(_ night: Night) -> some View {
+        let got = night.stages.asleep
+        let need = heroNeedMin(night)
+        VStack(alignment: .leading, spacing: NoopMetrics.space2) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("Sleep vs need").strandOverline()
+                Spacer(minLength: 8)
+                Text("\(durationText(got)) of \(durationText(need))")
+                    .font(StrandFont.captionNumber)
+                    .foregroundStyle(StrandPalette.textPrimary)
+            }
+            // PipBar over 0…need: the fill reads the share of the night's need that was met (capped at
+            // the bar's full width when a long night exceeds the need).
+            PipBar(value: got, range: 0...Swift.max(need, 1), tint: StrandPalette.restColor)
+            HStack(spacing: 8) {
+                Text(needBarRead(got: got, need: need))
+                    .font(StrandFont.footnote)
+                    .foregroundStyle(StrandPalette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 8)
+                SourceBadge("On-device estimate", tint: StrandPalette.restColor)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Slept \(durationText(got)) of \(durationText(need)) needed. On-device estimate.")
+    }
+
+    /// The personal need (minutes) for the hero's got/needed bar: the imported per-day WHOOP need for the
+    /// displayed night's wake-day when the export carried one (the `mergeSleep`/importer convention keys
+    /// sleep under the day you woke, matching `nightSource`), else the local personal-need floor
+    /// (`sleepNeedMin`). Mirrors the Hours-vs-Needed tile's need rule; does NOT modify `sleepNeedMin`.
+    private func heroNeedMin(_ night: Night) -> Double {
+        let wakeDay = Repository.localDayKey(Date(timeIntervalSince1970: TimeInterval(night.session.endTs)))
+        return repo.importedSleep[wakeDay]?.needMin ?? sleepNeedMin
+    }
+
+    /// Plain-English read under the got/needed bar: on/over need, or how far short.
+    private func needBarRead(got: Double, need: Double) -> String {
+        guard need > 0 else { return "" }
+        if got >= need { return String(localized: "You met your sleep need.") }
+        return String(localized: "\(durationText(need - got)) short of your need.")
     }
 
     // MARK: - Provenance for the displayed night (COMPONENT 4, spec 2026-06-20)
@@ -674,6 +731,11 @@ struct SleepView: View {
             if intervals.count >= 2 {
                 motionStrip(night)
             }
+            // Item 3 — WASO (wake after sleep onset) numeric, read from the night's stored daily column
+            // by its wake-day key (never re-derived from the awake stage). Self-gates on availability, so
+            // it renders only for an on-device-staged night that carries the figure — the same night that
+            // shows the motion strip above it.
+            wasoRow(night)
             // H9 — when the engine's Rest confidence flags this night's staging as low-confidence (a
             // high-efficiency night whose deep+REM share is implausibly low → a likely staging miss, not
             // a real night with no restorative sleep), say so honestly under the breakdown rather than
@@ -711,6 +773,39 @@ struct SleepView: View {
             }
         }
         .accessibilityElement(children: .contain)
+    }
+
+    /// Item 3 — the WASO (wake-after-sleep-onset) numeric shown near the motion strip. Reads the night's
+    /// stored daily `wasoMin` and, when present, renders a compact "awake after falling asleep" line with
+    /// its on-device-estimate badge. Renders nothing when the night has no stored WASO (an import-only
+    /// night, whose aggregate is nil), so the strip stays clean rather than showing a fabricated zero.
+    @ViewBuilder
+    private func wasoRow(_ night: Night) -> some View {
+        if let waso = wasoMinutes(for: night) {
+            HStack(spacing: 8) {
+                Text("Awake after falling asleep")
+                    .font(StrandFont.footnote)
+                    .foregroundStyle(StrandPalette.textTertiary)
+                Spacer(minLength: 8)
+                Text(durationText(waso))
+                    .font(StrandFont.captionNumber)
+                    .foregroundStyle(StrandPalette.textPrimary)
+                SourceBadge("On-device estimate", tint: StrandPalette.restColor)
+            }
+            .padding(.horizontal, 2)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Awake after falling asleep \(durationText(waso)), on-device estimate.")
+        }
+    }
+
+    /// The stored WASO (minutes) for a night, looked up on `repo.days` by the night's LOCAL wake-day key
+    /// (`Repository.localDayKey` over the wake instant) — the SAME keying the provenance badge uses, so a
+    /// navigated past night reads its OWN figure, not last night's. Deliberately NOT derived from
+    /// `night.stages.awake` (that conflates pre-sleep and post-wake awake with true WASO). nil when the
+    /// wake-day has no row or the column is empty. (Item 3)
+    private func wasoMinutes(for night: Night) -> Double? {
+        let wakeDay = Repository.localDayKey(Date(timeIntervalSince1970: TimeInterval(night.session.endTs)))
+        return repo.days.first(where: { $0.day == wakeDay })?.wasoMin
     }
 
     /// H9 — true when this night's staging is LOW-CONFIDENCE: a high-efficiency night (lots of measured
@@ -1016,6 +1111,10 @@ struct SleepView: View {
         let rest  = model.restorative
         let resp  = model.respiratory
         let debt  = model.sleepDebt
+        let awk   = model.disturbances     // Item 1
+        let sol   = model.onsetLatency     // Item 2
+        let remL  = model.remLatency       // Item 2
+        let hrv   = model.hrv              // Item 4
 
         VStack(alignment: .leading, spacing: NoopMetrics.gap) {
             SectionHeader("Night detail", overline: "Metrics", trailing: String(localized: "vs typical"))
@@ -1076,6 +1175,44 @@ struct SleepView: View {
                     accent: debtColor(debt.latest),
                     sparkline: spark(debt.series),
                     sparkColor: StrandPalette.metricRose)
+
+                // Item 1 — Awakenings: the night's disturbance count, straight from the EXISTING stored
+                // daily column (no approximation). Placed immediately after the Sleep Debt tile.
+                StatTile(
+                    label: "Awakenings",
+                    value: awk.latest.map { "\(Int($0.rounded()))" } ?? "—",
+                    caption: vsTypical(awk.latest, awk.typical, suffix: ""),
+                    accent: StrandPalette.metricAmber,
+                    sparkline: spark(awk.series),
+                    sparkColor: StrandPalette.metricAmber)
+
+                // Item 2 — Sleep-onset latency ("time to sleep"), from the NEW solMin column (minutes).
+                StatTile(
+                    label: "Time to sleep",
+                    value: sol.latest.map { durationText($0) } ?? "—",
+                    caption: vsTypical(sol.latest, sol.typical, suffix: "m"),
+                    accent: StrandPalette.metricCyan,
+                    sparkline: spark(sol.series),
+                    sparkColor: StrandPalette.metricCyan)
+
+                // Item 2 — REM latency, from the NEW remLatencyMin column (minutes; nil on a no-REM night).
+                StatTile(
+                    label: "REM latency",
+                    value: remL.latest.map { durationText($0) } ?? "—",
+                    caption: vsTypical(remL.latest, remL.typical, suffix: "m"),
+                    accent: StrandPalette.sleepREM,
+                    sparkline: spark(remL.series),
+                    sparkColor: StrandPalette.sleepREM)
+
+                // Item 4 — HRV during sleep, from the daily avgHrv column via metric() over repo.days
+                // (NOT the synthetic merged session, whose avgHrv is nil).
+                StatTile(
+                    label: "HRV (sleep)",
+                    value: hrv.latest.map { "\(Int($0.rounded()))" } ?? "—",
+                    caption: vsTypical(hrv.latest, hrv.typical, suffix: " ms"),
+                    accent: StrandPalette.statusPositive,
+                    sparkline: spark(hrv.series),
+                    sparkColor: StrandPalette.statusPositive)
             }
         }
     }
@@ -1313,6 +1450,56 @@ struct SleepView: View {
         }
     }
 
+    // MARK: - Item 6. Wind-down target (tonight)
+
+    /// Item 6 — the forward-looking wind-down card: tonight's target bedtime (wind-down time) → wake time,
+    /// derived purely from `WindDownNudge`'s static math (wake − sleep need − lead), mirroring
+    /// `SmartAlarmView.windowHero`. Read-only here — the toggle + settings live in Alarms; this card just
+    /// surfaces the target so a glance on the Sleep tab shows tonight's shape. Times use the same HH:MM
+    /// formatter Alarms uses. `WindDownNudge` returns sensible defaults (07:00 wake, 8h need, 30m lead)
+    /// even before the user touches Alarms, so the target always reads.
+    @ViewBuilder
+    private func windDownCard() -> some View {
+        let windDown = WindDownNudge.nudgeMinuteOfDay()
+        let wake = WindDownNudge.wakeMinutes
+        VStack(alignment: .leading, spacing: NoopMetrics.gap) {
+            SectionHeader("Wind-down target", overline: "Tonight", trailing: String(localized: "Rest"))
+            NoopCard(tint: StrandPalette.restColor) {
+                VStack(alignment: .leading, spacing: NoopMetrics.space4) {
+                    HStack(alignment: .firstTextBaseline, spacing: 14) {
+                        windDownTime(label: "Wind down", minute: windDown, tint: StrandPalette.restColor)
+                        Image(systemName: "arrow.right")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(StrandPalette.textTertiary)
+                            .accessibilityHidden(true)
+                        windDownTime(label: "Wake", minute: wake, tint: StrandPalette.restBright)
+                        Spacer(minLength: 0)
+                    }
+                    Text("Start winding down around \(clockLabel(windDown)) to reach your \(clockLabel(wake)) wake time rested, with \(WindDownNudge.sleepNeedMinutes / 60)h \(WindDownNudge.leadMinutes)m of runway.")
+                        .font(StrandFont.footnote)
+                        .foregroundStyle(StrandPalette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    /// One time cell of the wind-down card — an overline label over a big rounded HH:MM. Mirrors
+    /// `SmartAlarmView.heroTime`.
+    private func windDownTime(label: LocalizedStringKey, minute: Int, tint: Color) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).strandOverline()
+            Text(clockLabel(minute))
+                .font(StrandFont.number(28))
+                .foregroundStyle(tint)
+        }
+    }
+
+    /// Minute-of-day → "HH:MM" (mirrors `SmartAlarmView.timeLabel`).
+    private func clockLabel(_ minutes: Int) -> String {
+        String(format: "%02d:%02d", minutes / 60, minutes % 60)
+    }
+
     // MARK: - Memoization plumbing
 
     /// A cheap fingerprint of the repo inputs this screen derives from. Recomputed every
@@ -1365,6 +1552,10 @@ struct SleepView: View {
             restorative: restorativeSeries,
             respiratory: respiratorySeries,
             sleepDebt: sleepDebtSeries,
+            disturbances: disturbancesSeries,
+            onsetLatency: onsetLatencySeries,
+            remLatency: remLatencySeries,
+            hrv: hrvSeries,
             typicalTotalMin: typicalTotalMin,
             typicalDeepMin: typicalStageMin(\.deepMin),
             typicalRemMin: typicalStageMin(\.remMin),
@@ -1808,6 +1999,30 @@ struct SleepView: View {
         Swift.max(450, typicalTotalMin ?? 450)   // 450 min = 7.5h
     }
 
+    /// Item 1 — Awakenings per night: the EXISTING `disturbances` count as a Double series. metric()'s
+    /// finite filter keeps every real count (including 0 = an undisturbed night).
+    private var disturbancesSeries: Metric {
+        metric { $0.disturbances.map(Double.init) }
+    }
+
+    /// Item 2 — Sleep-onset latency (minutes) from the NEW `solMin` column.
+    private var onsetLatencySeries: Metric {
+        metric { $0.solMin }
+    }
+
+    /// Item 2 — REM latency (minutes) from the NEW `remLatencyMin` column (nil on a no-REM night, which
+    /// metric() drops from the series — never poisoning the mean).
+    private var remLatencySeries: Metric {
+        metric { $0.remLatencyMin }
+    }
+
+    /// Item 4 — HRV during sleep (ms): the daily `avgHrv` column via metric() over repo.days — the SAME
+    /// source Today's HRV reads. Deliberately NOT `night.session.avgHrv`, which is nil on the synthetic
+    /// merged session `mergeDay` builds for display.
+    private var hrvSeries: Metric {
+        metric { $0.avgHrv }
+    }
+
     // MARK: - Trend points
 
     /// Trailing 30 days of total sleep, plotted in HOURS. Falls back to all nights with
@@ -2204,6 +2419,12 @@ private struct SleepModel {
     let restorative: Metric
     let respiratory: Metric
     let sleepDebt: Metric
+    /// Awakenings / onset-latency / REM-latency / sleep-HRV series (Items 1, 2, 4). Each is a full
+    /// pass over repo.days computed once in `buildModel`, mirroring the seven metrics above.
+    let disturbances: Metric
+    let onsetLatency: Metric
+    let remLatency: Metric
+    let hrv: Metric
 
     let typicalTotalMin: Double?
     let typicalDeepMin: Double?

@@ -841,16 +841,20 @@ final class SleepStagerTests: XCTestCase {
 
     // MARK: - H4 physiological in-bed span cap (#547/#531/#509 tail)
 
-    func testDetectSleepClampsOverlongBadClockBlock() {
-        // A frozen-still 18 h "night" (a bad-clock artefact) exceeds the 16 h physiological cap → DROPPED,
-        // so it can never report a 12 h+ sleep. Anchored at a night hour with low HR so ONLY the span cap
-        // can reject it (the duration floor + HR confirmation both pass).
+    func testDetectSleepFlagsOverlongBadClockBlock() {
+        // A frozen-still 18 h "night" exceeds the 16 h physiological cap. It is no longer DROPPED:
+        // dropping silently invented a gap in the record, so the span cap now KEEPS the run but marks
+        // it `lowConfidence` (flag-not-drop) — the UI can caveat it rather than assert a bogus 18 h
+        // sleep or lose the night entirely. Anchored at a night hour with low HR so ONLY the span cap
+        // governs it (the duration floor + HR confirmation both pass).
         let start = nightStart(22)
         let dur = 18 * 60 * 60                     // 18 h > maxMainSleepSpanS (16 h)
         let grav = stillGravity(start: start, durationS: dur)
         let hr = hrStream(start: start, durationS: dur, bpm: 50)
-        XCTAssertTrue(SleepStager.detectSleep(hr: hr, gravity: grav).isEmpty,
-                      "an 18 h still block is a bad-clock artefact and is dropped by the span cap")
+        let sessions = SleepStager.detectSleep(hr: hr, gravity: grav)
+        XCTAssertEqual(sessions.count, 1, "an over-long block is kept (flagged), not dropped")
+        XCTAssertTrue(sessions.first?.lowConfidence == true,
+                      "the over-long bad-clock run is flagged low-confidence instead of dropped")
     }
 
     func testDetectSleepKeepsLongButPlausibleNight() {

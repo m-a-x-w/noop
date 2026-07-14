@@ -446,6 +446,29 @@ extension WhoopStore {
                 t.primaryKey(["deviceId", "startTs"])
             }
         }
+
+        // v23 (sleep-architecture latencies): sleep-onset latency, REM latency, and wake-after-sleep-onset,
+        // all in MINUTES, on dailyMetric. All three nullable REAL: a null means the aggregation had no
+        // matched sleep to measure (or, for remLatencyMin, a night with no REM at all), an absent signal
+        // stays absent, never a fabricated 0. Additive ALTERs only, so every existing row reads back null and
+        // an old reader that doesn't SELECT them keeps working. Twin of Android MIGRATION_16_17.
+        migrator.registerMigration("v23-sleep-latency-waso") { db in
+            try db.alter(table: "dailyMetric") { t in
+                t.add(column: "solMin", .double)
+                t.add(column: "remLatencyMin", .double)
+                t.add(column: "wasoMin", .double)
+            }
+        }
+
+        // v24 (sleep low-confidence flag): a `lowConfidence` flag on sleepSession marks a night the stager
+        // KEPT but was unsure of (the flag-not-drop path), so display can caveat it without losing the
+        // session. NOT NULL DEFAULT 0 so every existing row reads as confident and old readers that don't
+        // SELECT it keep working. Additive ALTER only. Twin of Android sleepSession low-confidence migration.
+        migrator.registerMigration("v24-sleep-low-confidence") { db in
+            try db.alter(table: "sleepSession") { t in
+                t.add(column: "lowConfidence", .boolean).notNull().defaults(to: false)
+            }
+        }
         return migrator
     }
 }

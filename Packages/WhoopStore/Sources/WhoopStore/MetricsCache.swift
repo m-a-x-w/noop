@@ -28,14 +28,19 @@ public struct CachedSleepSession: Equatable, Codable {
     public let startTsAdjusted: Int?
     /// The onset to display / stage from: the user's correction if present, else the detected `startTs`.
     public var effectiveStartTs: Int { startTsAdjusted ?? startTs }
+    /// True when the stager flagged (rather than dropped) this session as a low-confidence night — a
+    /// window it kept but is unsure of. Defaults false so every cache/recompute/import path that doesn't
+    /// know about the flag keeps producing confident rows.
+    public let lowConfidence: Bool
     public init(startTs: Int, endTs: Int, efficiency: Double?, restingHr: Int?,
                 avgHrv: Double?, stagesJSON: String?, userEdited: Bool = false,
-                startTsAdjusted: Int? = nil) {
+                startTsAdjusted: Int? = nil, lowConfidence: Bool = false) {
         self.startTs = startTs; self.endTs = endTs
         self.efficiency = efficiency; self.restingHr = restingHr
         self.avgHrv = avgHrv; self.stagesJSON = stagesJSON
         self.userEdited = userEdited
         self.startTsAdjusted = startTsAdjusted
+        self.lowConfidence = lowConfidence
     }
 }
 
@@ -61,17 +66,24 @@ public struct DailyMetric: Equatable, Codable {
     // imported/cloud rows that never carry them stay nil and old call sites are unaffected.
     public let steps: Int?             // daily step total from the cumulative @57 counter
     public let activeKcalEst: Double?  // whole-day HR-only calorie estimate (kcal)
+    // Sleep-architecture latency aggregates (v23 columns, MINUTES). All nullable; nil when the night
+    // has no matched sleep (and remLatencyMin also nil when the night has no REM at all).
+    public let solMin: Double?         // sleep-onset latency (min)
+    public let remLatencyMin: Double?  // REM latency (min); nil when night has no REM
+    public let wasoMin: Double?        // wake-after-sleep-onset (min)
     public init(day: String, totalSleepMin: Double?, efficiency: Double?, deepMin: Double?,
                 remMin: Double?, lightMin: Double?, disturbances: Int?, restingHr: Int?,
                 avgHrv: Double?, recovery: Double?, strain: Double?, exerciseCount: Int?,
                 spo2Pct: Double? = nil, skinTempDevC: Double? = nil, respRateBpm: Double? = nil,
-                steps: Int? = nil, activeKcalEst: Double? = nil) {
+                steps: Int? = nil, activeKcalEst: Double? = nil,
+                solMin: Double? = nil, remLatencyMin: Double? = nil, wasoMin: Double? = nil) {
         self.day = day; self.totalSleepMin = totalSleepMin; self.efficiency = efficiency
         self.deepMin = deepMin; self.remMin = remMin; self.lightMin = lightMin
         self.disturbances = disturbances; self.restingHr = restingHr; self.avgHrv = avgHrv
         self.recovery = recovery; self.strain = strain; self.exerciseCount = exerciseCount
         self.spo2Pct = spo2Pct; self.skinTempDevC = skinTempDevC; self.respRateBpm = respRateBpm
         self.steps = steps; self.activeKcalEst = activeKcalEst
+        self.solMin = solMin; self.remLatencyMin = remLatencyMin; self.wasoMin = wasoMin
     }
 
     /// The freshest STRICTLY-PRIOR day that carries at least one overnight vital (HRV / resting HR /
@@ -103,8 +115,8 @@ extension WhoopStore {
                 try db.execute(sql: """
                     INSERT INTO sleepSession
                         (deviceId, startTs, endTs, efficiency, restingHr, avgHrv, stagesJSON,
-                         userEdited, startTsAdjusted)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         userEdited, startTsAdjusted, lowConfidence)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(deviceId, startTs) DO UPDATE SET
                         -- A user-corrected night keeps its hand-set bed/wake times and stage breakdown;
                         -- a recompute/import refresh (this path) updates only the derived vitals. The
@@ -116,9 +128,11 @@ extension WhoopStore {
                         avgHrv = excluded.avgHrv,
                         stagesJSON = CASE WHEN sleepSession.userEdited THEN sleepSession.stagesJSON ELSE excluded.stagesJSON END,
                         startTsAdjusted = CASE WHEN sleepSession.userEdited THEN sleepSession.startTsAdjusted ELSE excluded.startTsAdjusted END,
-                        userEdited = sleepSession.userEdited
+                        userEdited = sleepSession.userEdited,
+                        lowConfidence = excluded.lowConfidence
                     """, arguments: [deviceId, s.startTs, s.endTs, s.efficiency,
-                                     s.restingHr, s.avgHrv, s.stagesJSON, s.userEdited, s.startTsAdjusted])
+                                     s.restingHr, s.avgHrv, s.stagesJSON, s.userEdited, s.startTsAdjusted,
+                                     s.lowConfidence])
                 n += db.changesCount
             }
             return n
@@ -295,8 +309,9 @@ extension WhoopStore {
                     INSERT INTO dailyMetric
                         (deviceId, day, totalSleepMin, efficiency, deepMin, remMin, lightMin,
                          disturbances, restingHr, avgHrv, recovery, strain, exerciseCount,
-                         spo2Pct, skinTempDevC, respRateBpm, steps, activeKcalEst)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         spo2Pct, skinTempDevC, respRateBpm, steps, activeKcalEst,
+                         solMin, remLatencyMin, wasoMin)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(deviceId, day) DO UPDATE SET
                         totalSleepMin = excluded.totalSleepMin,
                         efficiency = excluded.efficiency,
@@ -313,12 +328,16 @@ extension WhoopStore {
                         skinTempDevC = excluded.skinTempDevC,
                         respRateBpm = excluded.respRateBpm,
                         steps = excluded.steps,
-                        activeKcalEst = excluded.activeKcalEst
+                        activeKcalEst = excluded.activeKcalEst,
+                        solMin = excluded.solMin,
+                        remLatencyMin = excluded.remLatencyMin,
+                        wasoMin = excluded.wasoMin
                     """, arguments: [deviceId, d.day, d.totalSleepMin, d.efficiency, d.deepMin,
                                      d.remMin, d.lightMin, d.disturbances, d.restingHr, d.avgHrv,
                                      d.recovery, d.strain, d.exerciseCount,
                                      d.spo2Pct, d.skinTempDevC, d.respRateBpm,
-                                     d.steps, d.activeKcalEst])
+                                     d.steps, d.activeKcalEst,
+                                     d.solMin, d.remLatencyMin, d.wasoMin])
                 n += db.changesCount
             }
             return n
@@ -349,7 +368,7 @@ extension WhoopStore {
         try syncRead { db in
             try Row.fetchAll(db, sql: """
                 SELECT startTs, endTs, efficiency, restingHr, avgHrv, stagesJSON, userEdited,
-                       startTsAdjusted FROM sleepSession
+                       startTsAdjusted, lowConfidence FROM sleepSession
                 WHERE deviceId = ? AND startTs >= ? AND startTs <= ?
                 ORDER BY startTs ASC LIMIT ?
                 """, arguments: [deviceId, from, to, limit])
@@ -357,7 +376,8 @@ extension WhoopStore {
                     CachedSleepSession(startTs: $0["startTs"], endTs: $0["endTs"],
                                        efficiency: $0["efficiency"], restingHr: $0["restingHr"],
                                        avgHrv: $0["avgHrv"], stagesJSON: $0["stagesJSON"],
-                                       userEdited: $0["userEdited"], startTsAdjusted: $0["startTsAdjusted"])
+                                       userEdited: $0["userEdited"], startTsAdjusted: $0["startTsAdjusted"],
+                                       lowConfidence: $0["lowConfidence"])
                 }
         }
     }
@@ -368,7 +388,8 @@ extension WhoopStore {
             try Row.fetchAll(db, sql: """
                 SELECT day, totalSleepMin, efficiency, deepMin, remMin, lightMin, disturbances,
                        restingHr, avgHrv, recovery, strain, exerciseCount,
-                       spo2Pct, skinTempDevC, respRateBpm, steps, activeKcalEst FROM dailyMetric
+                       spo2Pct, skinTempDevC, respRateBpm, steps, activeKcalEst,
+                       solMin, remLatencyMin, wasoMin FROM dailyMetric
                 WHERE deviceId = ? AND day >= ? AND day <= ?
                 ORDER BY day ASC
                 """, arguments: [deviceId, from, to])
@@ -381,7 +402,9 @@ extension WhoopStore {
                                 strain: $0["strain"], exerciseCount: $0["exerciseCount"],
                                 spo2Pct: $0["spo2Pct"], skinTempDevC: $0["skinTempDevC"],
                                 respRateBpm: $0["respRateBpm"],
-                                steps: $0["steps"], activeKcalEst: $0["activeKcalEst"])
+                                steps: $0["steps"], activeKcalEst: $0["activeKcalEst"],
+                                solMin: $0["solMin"], remLatencyMin: $0["remLatencyMin"],
+                                wasoMin: $0["wasoMin"])
                 }
         }
     }

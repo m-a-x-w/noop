@@ -4,7 +4,7 @@ import Foundation
 //
 // Pure, deterministic, DB-free. Computes the Pearson product-moment correlation r,
 // a simple ordinary-least-squares regression line (slope/intercept of y on x), and
-// an approximate two-sided p-value for r.
+// a two-sided Student-t p-value for r.
 //
 //   r = Σ(x−x̄)(y−ȳ) / sqrt( Σ(x−x̄)² · Σ(y−ȳ)² )         (Pearson)
 //   slope     = Σ(x−x̄)(y−ȳ) / Σ(x−x̄)²                     (OLS, y on x)
@@ -12,11 +12,18 @@ import Foundation
 //
 // The p-value uses the standard t-statistic for a correlation,
 //   t = r · sqrt( (n−2) / (1−r²) ),
-// converted to a two-sided tail probability via a NORMAL approximation
-// (2·(1−Φ(|t|))). This is an approximation — for small n the true Student-t tails
-// are heavier, so pApprox slightly understates p — but it is fully deterministic
-// and needs no special-function tables. Φ is evaluated with the Abramowitz &
-// Stegun 7.1.26 erf rational approximation.
+// converted to the EXACT two-sided Student-t tail with df = n−2 via the regularized
+// incomplete beta function,
+//   p = I_x( df/2, 1/2 ),   x = df / (df + t²).
+// I_x is evaluated from its Lentz continued fraction (betaContinuedFraction) with a
+// Foundation `lgamma` prefactor, fully deterministic across arm64/x86_64 and, unlike
+// the earlier normal approximation, honest about the heavier small-n tails. The
+// normal CDF Φ (Abramowitz & Stegun 7.1.26 erf) is retained because BehaviorInsights'
+// Welch t-test still reads it.
+//
+// Family-level multiple-comparison correction is exposed separately: a caller with a
+// batch of raw per-pair p-values applies `benjaminiHochberg` (FDR q-values) or
+// `bonferroni` (family-wise) across the family before judging significance.
 //
 // `alignByDay` inner-joins two "yyyy-MM-dd"-keyed series on the day key, returning
 // (x, y) pairs sorted by day. `lagged` shifts y forward by `lagDays` relative to x
@@ -30,7 +37,9 @@ public struct Correlation: Equatable, Sendable {
     public let r: Double
     /// Number of paired observations used.
     public let n: Int
-    /// Approximate two-sided p-value for H0: r = 0 (normal approx of the t-test).
+    /// Raw two-sided p-value for H0: r = 0 (exact Student-t tail, df = n−2). Named
+    /// `pApprox` for source compatibility; it is the per-pair value before any
+    /// family-level FDR/Bonferroni correction.
     public let pApprox: Double
     /// OLS slope of y on x.
     public let slope: Double
@@ -131,15 +140,17 @@ public enum CorrelationEngine {
 
     // MARK: - p-value
 
-    /// Two-sided p-value for H0: r = 0 via t = r·sqrt((n−2)/(1−r²)) and a normal
-    /// approximation of the t tail. n ≤ 2 → 1.0 (no evidence); |r| = 1 → 0.0.
+    /// Two-sided p-value for H0: r = 0 via t = r·sqrt((n−2)/(1−r²)) and the EXACT
+    /// Student-t tail with df = n−2: p = I_x(df/2, 1/2), x = df/(df + t²). n ≤ 2 → 1.0
+    /// (no evidence); |r| = 1 → 0.0 (t → ∞, x → 0 → I_0 = 0).
     static func pValue(r: Double, n: Int) -> Double {
         guard n > 2 else { return 1.0 }
         let oneMinusR2 = 1.0 - r * r
         if oneMinusR2 <= 0 { return 0.0 }  // |r| == 1
-        let t = r * (Double(n - 2) / oneMinusR2).squareRoot()
-        // Two-sided tail of the standard normal at |t|.
-        return 2.0 * (1.0 - normalCDF(abs(t)))
+        let df = Double(n - 2)
+        let t = r * (df / oneMinusR2).squareRoot()
+        let x = df / (df + t * t)
+        return regularizedIncompleteBeta(x, df / 2.0, 0.5)
     }
 
     /// Standard-normal CDF Φ(z) using the A&S 7.1.26 erf approximation.
@@ -155,6 +166,96 @@ public enum CorrelationEngine {
         let y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t
                         - 0.284496736) * t + 0.254829592) * t * exp(-ax * ax)
         return sign * y
+    }
+
+    // MARK: - Regularized incomplete beta
+
+    /// Regularized incomplete beta I_x(a, b), the CDF machinery behind the Student-t
+    /// tail in `pValue`. Guards x ≤ 0 → 0 and x ≥ 1 → 1. The prefactor
+    /// x^a·(1−x)^b / (a·B(a,b)) is formed in log space via Foundation `lgamma`, and the
+    /// series is summed by its continued fraction, using the standard symmetry
+    /// I_x(a,b) = 1 − I_{1−x}(b,a) on the slow-converging side so the CF is always
+    /// evaluated where it converges fastest. Deterministic across arm64/x86_64.
+    static func regularizedIncompleteBeta(_ x: Double, _ a: Double, _ b: Double) -> Double {
+        if x <= 0.0 { return 0.0 }
+        if x >= 1.0 { return 1.0 }
+        let logBeta = lgamma(a + b) - lgamma(a) - lgamma(b)
+        let front = exp(logBeta + a * log(x) + b * log(1.0 - x))
+        if x < (a + 1.0) / (a + b + 2.0) {
+            return front * betaContinuedFraction(x, a, b) / a
+        } else {
+            return 1.0 - front * betaContinuedFraction(1.0 - x, b, a) / b
+        }
+    }
+
+    /// Lentz continued-fraction evaluation of the incomplete-beta CF used by
+    /// `regularizedIncompleteBeta`. Fixed 200-iteration cap with a 1e-12 relative
+    /// tolerance and the usual 1e-30 zero-guard; touches only libm, so it is
+    /// deterministic across architectures.
+    private static func betaContinuedFraction(_ x: Double, _ a: Double, _ b: Double) -> Double {
+        let tiny = 1e-30
+        let qab = a + b
+        let qap = a + 1.0
+        let qam = a - 1.0
+        var c = 1.0
+        var d = 1.0 - qab * x / qap
+        if abs(d) < tiny { d = tiny }
+        d = 1.0 / d
+        var h = d
+        for m in 1...200 {
+            let mD = Double(m)
+            let m2 = 2.0 * mD
+            // Even step: d_{2m}.
+            var aa = mD * (b - mD) * x / ((qam + m2) * (a + m2))
+            d = 1.0 + aa * d
+            if abs(d) < tiny { d = tiny }
+            c = 1.0 + aa / c
+            if abs(c) < tiny { c = tiny }
+            d = 1.0 / d
+            h *= d * c
+            // Odd step: d_{2m+1}.
+            aa = -(a + mD) * (qab + mD) * x / ((a + m2) * (qap + m2))
+            d = 1.0 + aa * d
+            if abs(d) < tiny { d = tiny }
+            c = 1.0 + aa / c
+            if abs(c) < tiny { c = tiny }
+            d = 1.0 / d
+            let del = d * c
+            h *= del
+            if abs(del - 1.0) < 1e-12 { break }
+        }
+        return h
+    }
+
+    // MARK: - Multiple-comparison correction
+
+    /// Benjamini–Hochberg FDR adjustment. Given m raw p-values it returns their
+    /// q-values in the SAME order as the input: sort ascending, scale the rank-i value
+    /// by m/i, enforce monotonicity from the largest rank down (a step-up ceiling), and
+    /// clamp to 1. Empty in → empty out; a single value returns itself (m/1 = 1).
+    public static func benjaminiHochberg(_ pValues: [Double]) -> [Double] {
+        let m = pValues.count
+        guard m > 0 else { return [] }
+        let mD = Double(m)
+        // Ascending order of the raw values, carrying original positions so the result
+        // can be handed back in input order.
+        let order = pValues.indices.sorted { pValues[$0] < pValues[$1] }
+        var adjusted = [Double](repeating: 0.0, count: m)
+        var ceiling = 1.0  // monotone step-up ceiling, walked from the largest rank down.
+        for rank in stride(from: m, through: 1, by: -1) {
+            let idx = order[rank - 1]
+            let q = pValues[idx] * mD / Double(rank)
+            ceiling = min(ceiling, q)
+            adjusted[idx] = min(1.0, ceiling)
+        }
+        return adjusted
+    }
+
+    /// Bonferroni family-wise correction: multiply each raw p-value by the family size
+    /// m and clamp to 1. Order-preserving; empty in → empty out.
+    public static func bonferroni(_ pValues: [Double]) -> [Double] {
+        let m = Double(pValues.count)
+        return pValues.map { min(1.0, $0 * m) }
     }
 
     // MARK: - Day arithmetic

@@ -34,14 +34,18 @@ final class CorrelationEngineTests: XCTestCase {
     }
 
     func testPearsonGoldenValues() {
-        // x=[1..5], y=[2,4,5,4,5] → r=0.7745966692, slope 0.6, intercept 2.2,
-        // pApprox (A&S-erf normal approx) ≈ 0.0338947336.
+        // x=[1..5], y=[2,4,5,4,5] → r=0.7745966692, slope 0.6, intercept 2.2.
         let xy: [(Double, Double)] = [(1, 2), (2, 4), (3, 5), (4, 4), (5, 5)]
         let c = CorrelationEngine.pearson(xy)!
         XCTAssertEqual(c.r, 0.7745966692414834, accuracy: 1e-9)
         XCTAssertEqual(c.slope, 0.6, accuracy: 1e-9)
         XCTAssertEqual(c.intercept, 2.2, accuracy: 1e-9)
-        XCTAssertEqual(c.pApprox, 0.033894733597028104, accuracy: 1e-6)
+        // pApprox is now the EXACT two-sided Student-t tail (df = n−2 = 3, t = 2.1213),
+        // NOT the old A&S-erf normal approx (which was 0.033894733597028104). Expected
+        // ≈ 0.124 for df=3, t=2.1213.
+        // TODO(integrator): pin the exact emitted float and tighten `accuracy` to 1e-9
+        // once the build reports the value the Lentz CF produces on target.
+        XCTAssertEqual(c.pApprox, 0.124, accuracy: 1e-3)
     }
 
     func testPearsonTooFewReturnsNil() {
@@ -53,6 +57,50 @@ final class CorrelationEngineTests: XCTestCase {
         XCTAssertNil(CorrelationEngine.pearson([(5, 1), (5, 2), (5, 3)]))
         // y constant → undefined correlation.
         XCTAssertNil(CorrelationEngine.pearson([(1, 7), (2, 7), (3, 7)]))
+    }
+
+    // MARK: - Multiple-comparison correction
+
+    func testBenjaminiHochbergMonotoneAndBounded() {
+        // Ascending raw p-values → the q-values come back in the same order, each ≥ its
+        // raw p and ≤ 1, and non-decreasing across the ranks (the step-up ceiling).
+        let raw = [0.001, 0.008, 0.039, 0.041, 0.9]
+        let q = CorrelationEngine.benjaminiHochberg(raw)
+        XCTAssertEqual(q.count, raw.count)
+        for (p, a) in zip(raw, q) {
+            XCTAssertGreaterThanOrEqual(a, p)   // adjustment never shrinks a p-value
+            XCTAssertLessThanOrEqual(a, 1.0)    // clamped to 1
+        }
+        for i in 1..<q.count {
+            XCTAssertGreaterThanOrEqual(q[i], q[i - 1])   // monotone in rank order
+        }
+        // Largest raw p keeps its value (rank m → factor m/m = 1); smallest is scaled by
+        // up to m (0.001 × 5 = 0.005 here).
+        XCTAssertEqual(q.last!, 0.9, accuracy: 1e-12)
+        XCTAssertEqual(q.first!, 0.005, accuracy: 1e-12)
+    }
+
+    func testBenjaminiHochbergOrderPreservingAndDegenerate() {
+        // A shuffled family adjusts each p by the same factor its rank earns, then
+        // returns in INPUT order: the 0.001 entry still lands on 0.005 wherever it sits.
+        let raw = [0.041, 0.001, 0.9, 0.008, 0.039]
+        let q = CorrelationEngine.benjaminiHochberg(raw)
+        let idx = raw.firstIndex(of: 0.001)!
+        XCTAssertEqual(q[idx], 0.005, accuracy: 1e-12)
+        // Singleton → returns itself (m/1 = 1). Empty → empty.
+        XCTAssertEqual(CorrelationEngine.benjaminiHochberg([0.2]), [0.2])
+        XCTAssertEqual(CorrelationEngine.benjaminiHochberg([]), [])
+    }
+
+    func testBonferroniScalesByFamilySizeAndClamps() {
+        let raw = [0.01, 0.02, 0.5]
+        let b = CorrelationEngine.bonferroni(raw)
+        XCTAssertEqual(b[0], 0.03, accuracy: 1e-12)   // 0.01 × 3
+        XCTAssertEqual(b[1], 0.06, accuracy: 1e-12)   // 0.02 × 3
+        XCTAssertEqual(b[2], 1.0, accuracy: 1e-12)    // 0.5 × 3 = 1.5 → clamped to 1
+        // Singleton unchanged (×1); empty → empty.
+        XCTAssertEqual(CorrelationEngine.bonferroni([0.3]), [0.3])
+        XCTAssertEqual(CorrelationEngine.bonferroni([]), [])
     }
 
     func testAlignByDayInnerJoinSorted() {

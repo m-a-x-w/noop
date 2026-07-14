@@ -276,6 +276,13 @@ final class IntelligenceEngine: ObservableObject {
         UserDefaults.standard.set(false, forKey: Self.timestampHealPendingKey)
     }
 
+    /// Cold-start floor for the personal sleep-need mean (`personalNeedHours`): below this many nights
+    /// of trailing sleep history we don't trust a thin mean and fall back to `Rest.defaultNeedHours`
+    /// (8 h), mirroring `computeHabitualMidsleep`'s cold-start guard. A week of nights is enough for a
+    /// stable DURATION mean (a simpler statistic than the time-of-day distribution the midsleep learner
+    /// needs, which is why that learner waits `SleepStageTotals.habitualMinDays` = 14).
+    private static let personalNeedMinNights = 7
+
     /// Compute on-device scores for each of the last `maxDays` that actually has raw HR data.
     /// Personal baselines (HRV / resting HR) are folded from the imported history, so even the first
     /// live night can be scored against your norm.
@@ -404,6 +411,31 @@ final class IntelligenceEngine: ObservableObject {
             windowStart: nowLocalMidnight - maxDays * 86_400 - 30 * 3_600,
             windowEnd: now, offsetSec: tzOffset)
 
+        // ── Personal sleep need / consistency / age (computed ONCE for the whole pass) ────────────────
+        // personalNeedHours: the trailing mean of nightly asleep hours, preferring the imported per-day
+        // sleep_need_min (ImportedSleepFigures.needMin) when the export carried one, floored at 7.5 h. This
+        // DUPLICATES SleepView.sleepNeedMin / CoupledView's personal-mean rule (reading the SAME merged
+        // `repo.days` the display reads) rather than sharing one helper yet — a documented drift a later
+        // refactor can unify. Under `personalNeedMinNights` of history we fall back to Rest.defaultNeedHours
+        // (8 h) instead of trusting a thin mean (cold-start, mirroring computeHabitualMidsleep). It drives
+        // the Rest composite's 0.50 duration term in analyzeDay (pass 1) AND the persisted series below.
+        let personalNeedHours: Double = {
+            let perNight: [Double] = repo.days.compactMap { d -> Double? in
+                if let need = repo.importedSleep[d.day]?.needMin, need > 0 { return need / 60.0 }
+                if let tst = d.totalSleepMin, tst > 0 { return tst / 60.0 }
+                return nil
+            }
+            guard perNight.count >= Self.personalNeedMinNights else { return AnalyticsEngine.Rest.defaultNeedHours }
+            return Swift.max(7.5, perNight.reduce(0, +) / Double(perNight.count))
+        }()
+        // Sleep/wake regularity in [0,1] (1 − CV of nightly durations) over the merged history; nil under
+        // 3 nights so the Rest composite's consistency term stays neutral (0.5) until there's real signal.
+        let sleepConsistency = VitalityEngine.sleepConsistency(
+            nightlyHours: repo.days.compactMap { $0.totalSleepMin }.map { $0 / 60.0 })
+        // Age (years) for the age-aware sleep-architecture targets; nil (unset profile) keeps the adult
+        // constants byte-for-byte. profile.age is an Int here (UserProfile.age is the Double twin).
+        let ageYears: Double? = profile.age > 0 ? Double(profile.age) : nil
+
         // ── FIX 1 (main-actor jank): run the ENTIRE per-day enumeration OFF the main actor ───────────
         // Every `await store.…` read inside this loop has its continuation RESUME on the main actor
         // (the engine is `@MainActor`), so on a fresh-import 4000-day pass the ~32 000 read-resumes
@@ -434,7 +466,14 @@ final class IntelligenceEngine: ObservableObject {
             var out: [DayScan] = []
             for offset in 0..<maxDays {
                 let dayStart = nowLocalMidnight - offset * 86_400
-                let day = AnalyticsEngine.dayString(dayStart, offsetSec: tzOffset)
+                // TZ-PER-DAY (DST): resolve THIS day's own wall-clock offset from its instant instead of the
+                // single once-from-now `tzOffset`, so a past day on the other side of a DST boundary buckets
+                // by ITS local calendar (its day key, calendar-day window, analyzeDay tz guard/bucket, and
+                // the steps trace all use it). The Android twin re-passes the same secondsFromGMT(for:) per
+                // day, so the platforms stay in lockstep. `dayStart` (the 86 400-spaced anchor) is unchanged.
+                let dayTzOffset = TimeZone.current.secondsFromGMT(
+                    for: Date(timeIntervalSince1970: TimeInterval(dayStart)))
+                let day = AnalyticsEngine.dayString(dayStart, offsetSec: dayTzOffset)
                 // Read a generous window around the night that ends on `day`; the stager finds the span.
                 let from = dayStart - 30 * 3_600
                 // Sleep read-window END. For a PAST day the night may end any time before the NEXT local
@@ -482,7 +521,7 @@ final class IntelligenceEngine: ObservableObject {
                 // analyzeDay's dayHr/daySteps, which use it ONLY for those totals. `dayStart` is already a
                 // LOCAL midnight; midnightLocal is idempotent on it (the store range is inclusive, so end
                 // at -1 s). (#277 , local-day bucketing.)
-                let dayMid = Self.midnightLocal(dayStart, offsetSec: tzOffset)
+                let dayMid = Self.midnightLocal(dayStart, offsetSec: dayTzOffset)
                 let dayEnd = dayMid + 86_400 - 1
                 // Same `owner` as the night window above (I2): the additive day totals must come from the
                 // one device that owns the day, never a mix.
@@ -557,7 +596,13 @@ final class IntelligenceEngine: ObservableObject {
                                                      skinTemp: skin,
                                                      skinTempFamily: skinFamily,   // #938
                                                      profile: up, baselines: baselines1, maxHROverride: maxHR,
-                                                     tzOffsetSeconds: tzOffset, wristOff: wristOff,
+                                                     tzOffsetSeconds: dayTzOffset, wristOff: wristOff,
+                                                     // Personal Rest inputs, computed once per run (above):
+                                                     // need drives the 0.50 duration term, consistency the
+                                                     // 0.10 regularity term (nil → neutral 0.5). Age flows
+                                                     // in via analyzeDay's own `profile.age`.
+                                                     sleepNeedHours: personalNeedHours,
+                                                     sleepConsistency: sleepConsistency,
                                                      habitualMidsleepSec: habitualMidsleepSec,
                                                      bandSleepState: bandSleepState,
                                                      // #690: thread the V2 toggle into the NORMAL staging path so
@@ -576,7 +621,7 @@ final class IntelligenceEngine: ObservableObject {
                 // Mirrors the Android IntelligenceEngine guard (stepsTraceSink != null && daySteps.isNotEmpty()).
                 if stepsTraceActive && !daySteps.isEmpty {
                     stepsTrace = StepsEstimateEngine.rawCounterTrace(
-                        daySteps: daySteps, dayKey: day, tzOffsetSeconds: tzOffset,
+                        daySteps: daySteps, dayKey: day, tzOffsetSeconds: dayTzOffset,
                         ticksPerStep: up.stepTicksPerStep)
                 }
                 // ── RHR floor-vs-mean diagnostic (#691) ────────────────────────────────────────────────
@@ -754,12 +799,16 @@ final class IntelligenceEngine: ObservableObject {
         for night in scoredNights {
             let daily = sleepEditedDaily(night.daily, detected: night.cachedSleep, editsByStart: editsByStart,
                                          habitualMidsleepSec: habitualMidsleepSec)
-            let recovery = recomputeRecovery(daily, baselines2)
+            let recovery = recomputeRecovery(daily, baselines2, needHours: personalNeedHours,
+                                             consistency: sleepConsistency, ageYears: ageYears)
             // Charge term-breakdown trace (Group G): only when the Recovery test mode is on. Emits which
             // term moved Charge and which was nil and forced the renorm, tagged `.recovery`. The trace's
             // score is RecoveryScorer.recovery verbatim, so the `recovery` written above is unchanged.
             if recoveryTraceActive {
-                for line in recoveryTraceLines(daily, baselines2) { diagnosticSink?(line, .recovery) }
+                for line in recoveryTraceLines(daily, baselines2, needHours: personalNeedHours,
+                                               consistency: sleepConsistency, ageYears: ageYears) {
+                    diagnosticSink?(line, .recovery)
+                }
             }
             let skinDev = recomputeSkinTempDev(night.nightlySkin, baselines2.skinTemp)
             let source = DaySource.classify(day: daily.day, importedWhoopDays: importedWhoopDays,
@@ -767,7 +816,8 @@ final class IntelligenceEngine: ObservableObject {
             // SHARED CONTRACT enrichment: the ordered Charge driver list + the relative skin-temp marker,
             // built from the SAME inputs `recomputeRecovery` reads so the rows can never disagree with the
             // headline. Both are empty/nil pre-baseline (cold-start), matching the score's own null-honesty.
-            let drivers = recomputeChargeDrivers(daily, baselines2)
+            let drivers = recomputeChargeDrivers(daily, baselines2, needHours: personalNeedHours,
+                                                 consistency: sleepConsistency, ageYears: ageYears)
             let skinRel = RecoveryScorer.skinTempRelative(deviationC: skinDev)
             // Honest per-day Charge confidence (A3): the strap night reads `.solid`/`.building`/`.calibrating`
             // off the HRV baseline state rather than a blanket `.solid`, so a thin/provisional baseline shows
@@ -807,7 +857,11 @@ final class IntelligenceEngine: ObservableObject {
                     importedApple: appleHealthDays.contains(daily.day)), .universal)
             }
             dailies.append(daily.with(recovery: recovery, skinTempDevC: skinDev))
-            if let rest = AnalyticsEngine.Rest.composite(daily: daily) {
+            // The AUTHORITATIVE personalized Rest score: thread the per-run personal need / consistency /
+            // age so the persisted `sleep_performance` series reflects them (the bare display-side
+            // composite(daily:) call sites keep the age-neutral/8 h defaults — a documented divergence).
+            if let rest = AnalyticsEngine.Rest.composite(daily: daily, needHours: personalNeedHours,
+                                                         consistency: sleepConsistency, ageYears: ageYears) {
                 restPoints.append(MetricPoint(day: daily.day, key: "sleep_performance", value: rest))
             }
             cachedSleep.append(contentsOf: night.cachedSleep)
@@ -911,7 +965,8 @@ final class IntelligenceEngine: ObservableObject {
                 let scored = row.with(recovery: recovery, skinTempDevC: row.skinTempDevC)
                 dailies.append(scored)
                 importScoredDays.insert(w.day)
-                if let rest = AnalyticsEngine.Rest.composite(daily: scored) {
+                if let rest = AnalyticsEngine.Rest.composite(daily: scored, needHours: personalNeedHours,
+                                                             consistency: sleepConsistency, ageYears: ageYears) {
                     restPoints.append(MetricPoint(day: w.day, key: "sleep_performance", value: rest))
                 }
                 out.append(Computed(day: w.day, recovery: recovery, strain: scored.strain,
@@ -1345,12 +1400,17 @@ final class IntelligenceEngine: ObservableObject {
     /// baseline is usable (RecoveryScorer gates on `hrvBaseline.usable`, i.e. ≥ minNightsSeed valid
     /// nights) , so the honest null-until-4-nights cold-start is free. Mirrors AnalyticsEngine's own
     /// recovery call + Android IntelligenceEngine.recomputeRecovery. (#78)
-    private func recomputeRecovery(_ daily: DailyMetric, _ baselines: AnalyticsEngine.ProfileBaselines) -> Double? {
+    private func recomputeRecovery(_ daily: DailyMetric, _ baselines: AnalyticsEngine.ProfileBaselines,
+                                   needHours: Double, consistency: Double?, ageYears: Double?) -> Double? {
         guard let hrvVal = daily.avgHrv, let rhrVal = daily.restingHr, let hrvBase = baselines.hrv else { return nil }
         // Charge enrichment: feed the Rest COMPOSITE (÷100) as the sleep-quality term instead of raw
         // efficiency, and fold in the night's skin-temp deviation. Both come from the persisted daily
-        // fields (the raw streams are gone in pass 2). (Charge/Effort/Rest scoring redesign.)
-        let restQuality = AnalyticsEngine.Rest.composite(daily: daily).map { $0 / 100.0 } ?? daily.efficiency
+        // fields (the raw streams are gone in pass 2). (Charge/Effort/Rest scoring redesign.) Thread the
+        // SAME personal need / consistency / age the persisted `sleep_performance` series used above so the
+        // pass-2 Charge "Rest quality" term stays byte-aligned with the displayed Rest score.
+        let restQuality = AnalyticsEngine.Rest.composite(daily: daily, needHours: needHours,
+                                                         consistency: consistency,
+                                                         ageYears: ageYears).map { $0 / 100.0 } ?? daily.efficiency
         return RecoveryScorer.recovery(hrv: hrvVal, rhr: Double(rhrVal), resp: daily.respRateBpm,
                                        hrvBaseline: hrvBase, rhrBaseline: baselines.restingHR,
                                        respBaseline: baselines.resp, sleepPerf: restQuality,
@@ -1364,11 +1424,15 @@ final class IntelligenceEngine: ObservableObject {
     /// (HRV / RHR / HRV-baseline) is missing or the baseline isn't usable yet, mirroring `recomputeRecovery`'s
     /// own early-nil so a cold-start night shows the calibrating state rather than fabricated rows.
     private func recomputeChargeDrivers(_ daily: DailyMetric,
-                                        _ baselines: AnalyticsEngine.ProfileBaselines) -> [ChargeDriver] {
+                                        _ baselines: AnalyticsEngine.ProfileBaselines,
+                                        needHours: Double, consistency: Double?,
+                                        ageYears: Double?) -> [ChargeDriver] {
         guard let hrvVal = daily.avgHrv, let rhrVal = daily.restingHr, let hrvBase = baselines.hrv else {
             return []
         }
-        let restQuality = AnalyticsEngine.Rest.composite(daily: daily).map { $0 / 100.0 } ?? daily.efficiency
+        let restQuality = AnalyticsEngine.Rest.composite(daily: daily, needHours: needHours,
+                                                         consistency: consistency,
+                                                         ageYears: ageYears).map { $0 / 100.0 } ?? daily.efficiency
         return RecoveryScorer.chargeDrivers(hrv: hrvVal, rhr: Double(rhrVal), resp: daily.respRateBpm,
                                             hrvBaseline: hrvBase, rhrBaseline: baselines.restingHR,
                                             respBaseline: baselines.resp, sleepPerf: restQuality,
@@ -1381,12 +1445,16 @@ final class IntelligenceEngine: ObservableObject {
     /// trace can never diverge from the Charge number written for the day. Empty when a hard input
     /// (HRV / RHR / HRV-baseline) is missing, mirroring `recomputeRecovery`'s own early-nil. Only CALLED
     /// when `TestCentre.active(.recovery)` is true, so it costs nothing when the mode is off.
-    private func recoveryTraceLines(_ daily: DailyMetric, _ baselines: AnalyticsEngine.ProfileBaselines) -> [String] {
+    private func recoveryTraceLines(_ daily: DailyMetric, _ baselines: AnalyticsEngine.ProfileBaselines,
+                                    needHours: Double, consistency: Double?,
+                                    ageYears: Double?) -> [String] {
         guard let hrvVal = daily.avgHrv, let rhrVal = daily.restingHr, let hrvBase = baselines.hrv else {
             return ["charge day=\(daily.day) nilScore reason=missingInput "
                 + "(hrv/rhr/hrvBaseline required)"]
         }
-        let restQuality = AnalyticsEngine.Rest.composite(daily: daily).map { $0 / 100.0 } ?? daily.efficiency
+        let restQuality = AnalyticsEngine.Rest.composite(daily: daily, needHours: needHours,
+                                                         consistency: consistency,
+                                                         ageYears: ageYears).map { $0 / 100.0 } ?? daily.efficiency
         let (_, trace) = RecoveryScorer.recoveryTrace(
             hrv: hrvVal, rhr: Double(rhrVal), resp: daily.respRateBpm,
             hrvBaseline: hrvBase, rhrBaseline: baselines.restingHR,
@@ -1609,7 +1677,11 @@ private extension DailyMetric {
                     remMin: remMin, lightMin: lightMin, disturbances: disturbances, restingHr: restingHr,
                     avgHrv: avgHrv, recovery: r, strain: strain, exerciseCount: exerciseCount,
                     spo2Pct: spo2Pct, skinTempDevC: sd, respRateBpm: respRateBpm,
-                    steps: steps, activeKcalEst: activeKcalEst)
+                    steps: steps, activeKcalEst: activeKcalEst,
+                    // Carry the v23 sleep-latency fields through the rebuild — this is the row analyzeRecent
+                    // PERSISTS, so dropping them here would nil out solMin/remLatencyMin/wasoMin on every
+                    // computed day even though analyzeDay populated them.
+                    solMin: solMin, remLatencyMin: remLatencyMin, wasoMin: wasoMin)
     }
 
     /// Rebuild with substituted sleep-derived fields (a user-corrected wake window), leaving every
@@ -1620,6 +1692,11 @@ private extension DailyMetric {
                     disturbances: disturbances, restingHr: restingHr, avgHrv: avgHrv, recovery: recovery,
                     strain: strain, exerciseCount: exerciseCount, spo2Pct: spo2Pct,
                     skinTempDevC: skinTempDevC, respRateBpm: respRateBpm, steps: steps,
-                    activeKcalEst: activeKcalEst)
+                    activeKcalEst: activeKcalEst,
+                    // Preserve the detected night's v23 latency fields across a user-sleep-edit rebuild.
+                    // dailyAggregateHonoringEdits recomputes only duration/efficiency/stage minutes, so the
+                    // pre-edit SOL/REM-latency/WASO are the best available (carried, not nilled). Documented
+                    // caveat: an edited window keeps the DETECTED latencies (no recompute API yet).
+                    solMin: solMin, remLatencyMin: remLatencyMin, wasoMin: wasoMin)
     }
 }

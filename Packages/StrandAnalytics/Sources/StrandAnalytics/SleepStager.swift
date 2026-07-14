@@ -50,11 +50,18 @@ public struct SleepSession: Equatable, Sendable {
     public let restingHR: Int?
     /// Mean RMSSD over 5-min windows across the session (ms), or nil.
     public let avgHRV: Double?
+    /// Flag-not-drop marker (#547/#531/#509 tail): the assembled in-bed span exceeded the physiological
+    /// cap (`maxMainSleepSpanS`) and so is a probable bad-clock artefact — but it is RETAINED (marked
+    /// low-confidence) rather than dropped, so a night is never silently erased and downstream can
+    /// down-weight the artefact. Default false: every ordinary night (span within the cap) and every
+    /// other construction path/test is byte-identical.
+    public let lowConfidence: Bool
 
     public init(start: Int, end: Int, efficiency: Double, stages: [StageSegment],
-                restingHR: Int?, avgHRV: Double?) {
+                restingHR: Int?, avgHRV: Double?, lowConfidence: Bool = false) {
         self.start = start; self.end = end; self.efficiency = efficiency
         self.stages = stages; self.restingHR = restingHR; self.avgHRV = avgHRV
+        self.lowConfidence = lowConfidence
     }
 }
 
@@ -201,6 +208,14 @@ public enum SleepStager {
     /// otherwise dense, worn day (#500) is still caught.
     static let hrDenseSpacingS: Int = 600   // one HR sample per 10 minutes, averaged over the stream
 
+    /// Per-sample gravity change (g) at/below which a sample is read as DEAD-FLAT for the gravity
+    /// off-wrist proxy (#500 companion). An order of magnitude below `gravityStillThresholdG` (0.01):
+    /// a WORN but still wrist keeps micro-motion above this floor, while a strap set on a surface holds
+    /// a truly constant gravity vector (Δ ≈ 0). Used ONLY on the sparse/absent-HR path (see
+    /// `offWristGravitySpans`), where the HR-gap proxy is disabled and gravity flatness is the off-wrist
+    /// tell; on a dense worn night the gravity proxy is inert, so this never touches the 4.0 path.
+    public static let offWristGravityFlatG: Double = 0.001
+
     // MARK: - Sparse-gravity robustness (#308)
 
     // On an un-unlocked WHOOP 5.0 the strap backfills mostly v18/v26 records where gravity is
@@ -252,6 +267,16 @@ public enum SleepStager {
     /// HR-variance half of the WAKE rule. ~50% keeps a real worn 4.0 night (dense R-R) on the strict
     /// path and only relaxes nights whose cardiac signal is genuinely sparse/derived. (#705)
     public static let cardiacSparseEpochFrac: Double = 0.5
+
+    /// Session HF (parasympathetic, 0.15–0.40 Hz) power floor (ms²) for the pro-deep verdict on the
+    /// SPARSE-cardiac path (#705 companion). When most sleep epochs carry no per-epoch RMSSD the blanket
+    /// pro-deep fallback (`parasympOK = true`) can't tell deep from light, so — when we can read the
+    /// whole night's HF power from the R-R stream (`HRVFreqDomain.freqDomain`) — deep additionally
+    /// requires that power to clear this floor: real slow-wave sleep carries genuine vagal HF power, a
+    /// still low-HR light stretch need not. A conservative floor: below it we don't strengthen (falls
+    /// back to the existing rule), so the change only ever ADDS discrimination when HF evidence exists.
+    /// Inert on the dense path (finite per-epoch RMSSD), so 4.0 goldens are byte-identical.
+    public static let hfDeepMinPowerMs2: Double = 100.0
 
     public static let smoothEpochs: Int = 5
     public static let noREMAfterOnsetMin: Double = 15.0
@@ -649,19 +674,65 @@ public enum SleepStager {
         return spans
     }
 
+    /// Gravity dead-flat off-wrist spans (#500 companion, change 3). The contiguous stretches WITHIN
+    /// [p.start, p.end] where consecutive gravity Δ stays at/below `offWristGravityFlatG` for at least
+    /// `offWristHRGapMin` minutes — a strap held at a constant orientation (set on a surface) reads as a
+    /// dead-flat gravity vector, whereas a worn but still wrist keeps micro-motion above the flat floor.
+    ///
+    /// GATED on the SAME HR-density predicate `offWristHRGapSpans` uses, in the COMPLEMENTARY direction:
+    /// this proxy engages ONLY where the HR-gap proxy is DISABLED — HR sparse or absent (a synced 5.0
+    /// motion-reconstructed night). On a dense worn night (WHOOP 4.0, dense HR) the HR-gap proxy owns the
+    /// backstop and this returns [], so dense goldens are byte-identical. `grav` is ts-ascending (the
+    /// sorted stream) and `deltas` is its sibling `gravityDeltas` array (same indices).
+    static func offWristGravitySpans(_ p: Period, grav: [GravitySample], deltas: [Double],
+                                     hr: [HRSample]) -> [(start: Int, end: Int)] {
+        if grav.count < 2 || p.end <= p.start { return [] }
+        // Complement of offWristHRGapSpans' density gate: dense HR → the HR-gap proxy handles it, so the
+        // gravity proxy stays inert (empty). Absent HR or sparse HR → engage.
+        if !hr.isEmpty {
+            let streamSpan = hr[hr.count - 1].ts - hr[0].ts
+            let hrSparse = streamSpan >= hrDenseSpacingS && hr.count < streamSpan / hrDenseSpacingS
+            if !hrSparse { return [] }
+        }
+        let gapS = offWristHRGapMin * 60
+        let lo = lowerBoundIndex(grav, p.start) { $0.ts }
+        let hi = upperBoundIndex(grav, p.end) { $0.ts }
+        if lo >= hi { return [] }
+        var spans: [(start: Int, end: Int)] = []
+        var runStart: Int? = nil          // ts of the first sample of the current dead-flat run
+        var runEnd = grav[lo].ts
+        for i in lo..<hi {
+            let flat = i < deltas.count && deltas[i] <= offWristGravityFlatG
+            if flat {
+                if runStart == nil { runStart = grav[i].ts }
+                runEnd = grav[i].ts
+            } else {
+                if let s = runStart, runEnd - s >= gapS { spans.append((start: s, end: runEnd)) }
+                runStart = nil
+            }
+        }
+        if let s = runStart, runEnd - s >= gapS { spans.append((start: s, end: runEnd)) }
+        return spans
+    }
+
     /// Fractional off-wrist coverage of a candidate run [p.start, p.end] in [0, 1] (#500).
     /// Design credited to j0b-dev's #504 analysis: instead of a binary drop on ANY HR gap or ANY single
     /// WRIST_OFF blip, we measure how much of the run is off-wrist and let the caller drop it only past
-    /// `maxOffWristSleepFraction`. Coverage = (length of the UNION of) the HR-gap spans (`offWristHRGapSpans`)
-    /// AND the supplied WRIST_OFF→WRIST_ON `wristOff` intervals, clipped to the run, divided by duration.
-    /// Unioning avoids double-counting overlapping gap+event time. A real night with a small (<50%)
-    /// off-wrist tail scores low and is kept; an all-day desk strap (HR-gap ≈100%, no events needed) or a
-    /// session genuinely spent off the wrist scores high and is dropped.
-    static func offWristFraction(_ p: Period, hr: [HRSample], wristOff: [(start: Int, end: Int)]) -> Double {
+    /// `maxOffWristSleepFraction`. Coverage = (length of the UNION of) the HR-gap spans (`offWristHRGapSpans`),
+    /// the gravity dead-flat spans (`offWristGravitySpans`, sparse/absent-HR path only), AND the supplied
+    /// WRIST_OFF→WRIST_ON `wristOff` intervals, clipped to the run, divided by duration. Unioning avoids
+    /// double-counting overlapping spans. A real night with a small (<50%) off-wrist tail scores low and is
+    /// kept; an all-day desk strap (HR-gap ≈100%, no events needed) or a session genuinely spent off the
+    /// wrist scores high and is dropped. `grav`/`deltas` default empty so callers without a gravity stream
+    /// (and the frozen unit tests) get the HR-gap + event behaviour unchanged.
+    static func offWristFraction(_ p: Period, hr: [HRSample], wristOff: [(start: Int, end: Int)],
+                                 grav: [GravitySample] = [], deltas: [Double] = []) -> Double {
         let dur = p.end - p.start
         if dur <= 0 { return 0 }
-        // Collect every off-wrist span, clipped to the run: HR-gap proxy spans + explicit wrist-off events.
+        // Collect every off-wrist span, clipped to the run: HR-gap proxy spans + gravity dead-flat spans
+        // (sparse/absent-HR path) + explicit wrist-off events.
         var spans = offWristHRGapSpans(p, hr: hr)
+        spans.append(contentsOf: offWristGravitySpans(p, grav: grav, deltas: deltas, hr: hr))
         for w in wristOff {
             let s = max(w.start, p.start), e = min(w.end, p.end)
             if e > s { spans.append((start: s, end: e)) }
@@ -835,14 +906,18 @@ public enum SleepStager {
             }
             // H4 physiological in-bed span cap (#547/#531/#509 tail): a single assembled main-sleep run
             // longer than ~16 h is a bad-clock artefact (a frozen still stretch banked under a stale/wrong
-            // clock), not a real night. Drop it rather than report (or truncate to) a 12 h+ "sleep" — an
-            // over-long block can't be trusted to assert a span at all, and truncating would fabricate a
-            // wake time. Checked before staging so the artefact never reaches the aggregate.
+            // clock), not a real night. FLAG-not-drop (change 4): rather than DROP it — which erased the
+            // night (and its Rest / debt ledger) entirely and left a hole — KEEP it but mark the session
+            // low-confidence, so the artefact is surfaced and can be down-weighted downstream instead of
+            // vanishing. Ordinary nights (span within the cap) never set the flag, so their output is
+            // byte-identical.
+            var lowConfidence = false
             if (p.end - p.start) > maxMainSleepSpanS {
+                lowConfidence = true
                 traceSink?(GateTrace.runLine(index: runIndex, startTs: p.start, endTs: p.end,
-                    verdict: .dropped, gate: "maxMainSleepSpanS",
-                    detail: "spanMin=\(spanMin) maxMainSleepSpanMin=\(maxMainSleepSpanS / 60)"))
-                continue
+                    verdict: .kept, gate: "maxMainSleepSpanS",
+                    detail: "spanMin=\(spanMin) maxMainSleepSpanMin=\(maxMainSleepSpanS / 60) lowConfidence=true"))
+                // fall through — the over-long run is retained, flagged low-confidence (no continue).
             }
             if !confirmSleepWithHR(p, hr: hrS, baseline: baseline) {
                 traceSink?(GateTrace.runLine(index: runIndex, startTs: p.start, endTs: p.end,
@@ -860,7 +935,7 @@ public enum SleepStager {
             // (≈100% gap) is still dropped. Checked BEFORE the night-tail exemption: off-wrist time is
             // off-wrist day or night and must NOT ride a continuation chain. It does NOT re-anchor the
             // chain (the run is simply skipped).
-            let offFrac = offWristFraction(p, hr: hrS, wristOff: wristOff)
+            let offFrac = offWristFraction(p, hr: hrS, wristOff: wristOff, grav: grav, deltas: deltas)
             if offFrac >= maxOffWristSleepFraction {
                 traceSink?(GateTrace.runLine(index: runIndex, startTs: p.start, endTs: p.end,
                     verdict: .dropped, gate: "offWrist",
@@ -902,13 +977,21 @@ public enum SleepStager {
             let eff = efficiency(start: p.start, end: p.end, stages: stages)
             let avgHrv = sessionAvgHRV(start: p.start, end: p.end, rr: rrS)
             sessions.append(SleepSession(start: p.start, end: p.end, efficiency: eff,
-                                         stages: stages, restingHR: resting, avgHRV: avgHrv))
+                                         stages: stages, restingHR: resting, avgHRV: avgHrv,
+                                         lowConfidence: lowConfidence))
             traceSink?(GateTrace.runLine(index: runIndex, startTs: p.start, endTs: p.end,
                 verdict: .kept, gate: "accepted",
                 detail: "spanMin=\(spanMin) eff=\(round2(eff)) restingHR=\(resting ?? -1) daytime=\(isDaytime)"))
-            // A run that does NOT continue the chain re-anchors it on this run's onset.
-            if !continuesChain { chainFromOvernight = isOvernightOnset(p.start, tzOffsetSeconds: tzOffsetSeconds) }
-            chainPrevEnd = p.end
+            // A run that does NOT continue the chain re-anchors it on this run's onset — EXCEPT a
+            // low-confidence over-long (>16 h bad-clock) run, which is kept for surfacing but stays
+            // chain-NEUTRAL. Like the off-wrist backstop above, an artefact must not re-anchor the
+            // continuation chain: pre-flag it was dropped and never touched chain state, so letting it
+            // set chainPrevEnd/chainFromOvernight would flip a FOLLOWING ordinary run's night-tail
+            // acceptance and break the byte-identical-ordinary-nights guarantee.
+            if !lowConfidence {
+                if !continuesChain { chainFromOvernight = isOvernightOnset(p.start, tzOffsetSeconds: tzOffsetSeconds) }
+                chainPrevEnd = p.end
+            }
         }
         sessions.sort { $0.start < $1.start }
         return sessions
@@ -997,8 +1080,20 @@ public enum SleepStager {
         let (onsetIdx, finalWakeIdx) = onsetAndFinalWake(ckFlags)
 
         let dogHR = dogHRVariability(grid.hr)
+        // change 1: a genuinely empty resp segment turns on the RR-RSA fallback in extractFeatures.
+        // change 2: the session HF (parasympathetic) power over the window's R-R, used only on the
+        // sparse-cardiac deep path. Both are inert on a dense WHOOP-4.0 night (resp present + finite
+        // per-epoch RMSSD), so the frozen hypnogram goldens are byte-identical.
+        let respChannelEmpty = respSeg.isEmpty
+        // NOTE: computed for every session, though only the sparse-cardiac deep path reads it. A precise
+        // skip-on-dense gate needs `isCardiacSparse`, which depends on per-epoch RMSSD computed downstream
+        // in extractFeatures — so gating here would either duplicate that binning or risk skipping a
+        // genuinely sparse night. Left eager (guarded on non-empty RR): stageSession memoizes per session,
+        // so it's one spectrum per sleep session, not per render. (deferred micro-opt)
+        let sessionHF = rrSeg.isEmpty ? Double.nan : (HRVFreqDomain.freqDomain(rr: rrSeg)?.hf ?? Double.nan)
         let feats = extractFeatures(grid: grid, ckFlags: ckFlags, dogHR: dogHR,
-                                    onsetIdx: onsetIdx, finalWakeIdx: finalWakeIdx)
+                                    onsetIdx: onsetIdx, finalWakeIdx: finalWakeIdx,
+                                    respChannelEmpty: respChannelEmpty, sessionHF: sessionHF)
 
         var labels = classifyEpochs(feats)
         labels = smoothLabels(labels)
@@ -1437,6 +1532,73 @@ public enum SleepStager {
         return respPlausibleRangeBpm.contains(median) ? median : nan
     }
 
+    /// Per-WINDOW RSA respiratory rate + RRV from a feature window's R-R intervals (ms) — the resp-absent
+    /// path's substitute for `respRateAndRRV` (change 1). A WHOOP5 RR-only night carries no raw resp ADC,
+    /// so `respRateAndRRV` yields (nan, nan) and the REM classifier collapses to its strict no-resp
+    /// fallback. This derives the breathing modulation from beat-to-beat timing (respiratory sinus
+    /// arrhythmia) using the SAME tachogram → 4 Hz resample → moving-mean detrend → peak-pick pipeline as
+    /// `respRateFromRR`, but over a SINGLE window and WITHOUT the plausible-band clamp: the classifier keys
+    /// on the RRV IRREGULARITY, and clamping the rate would discard windows whose RSA rate sits at the
+    /// noise floor. Range-filters its input like `respRateFromRR`. Returns (rate breaths/min, rrv s) or
+    /// (nan, nan) when too few intervals survive. Pure + deterministic; a sibling of `respRateAndRRV`.
+    static func rsaRateAndRRV(_ rrMs: [Double]) -> (Double, Double) {
+        let nan = Double.nan
+        let filtered = HRVAnalyzer.rangeFilter(rrMs)
+        if filtered.count < 20 { return (nan, nan) }   // enough beats for a per-window RSA estimate
+
+        // Reconstruct beat times (seconds from window start) by cumulative sum of the kept R-R.
+        var beatTimes = [Double](repeating: 0, count: filtered.count)
+        var acc = 0.0
+        for i in filtered.indices {
+            acc += filtered[i] / 1000.0
+            beatTimes[i] = acc
+        }
+        let totalSpanS = beatTimes[beatTimes.count - 1]
+        if totalSpanS < rsaMinPeakDistanceS * 3 { return (nan, nan) }
+
+        // Resample onto a uniform ~4 Hz grid by linear interpolation (same as respRateFromRR).
+        let dt = 1.0 / rsaResampleHz
+        let nGrid = Int(totalSpanS / dt) + 1
+        if nGrid < 8 { return (nan, nan) }
+        var grid = [Double](repeating: 0, count: nGrid)
+        var seg = 0
+        for g in 0..<nGrid {
+            let t = Double(g) * dt
+            while seg < beatTimes.count - 2 && beatTimes[seg + 1] < t { seg += 1 }
+            let t0 = beatTimes[seg]
+            let t1 = beatTimes[seg + 1]
+            let v0 = filtered[seg]
+            let v1 = filtered[seg + 1]
+            grid[g] = t1 <= t0 ? v0 : v0 + min(max((t - t0) / (t1 - t0), 0), 1) * (v1 - v0)
+        }
+
+        // Detrend: subtract a centered moving mean (removes slow LF/baseline drift).
+        let halfW = max(1, Int((rsaDetrendWindowS * rsaResampleHz / 2.0).rounded()))
+        var detrended = [Double](repeating: 0, count: nGrid)
+        for i in 0..<nGrid {
+            let lo = max(0, i - halfW)
+            let hi = min(nGrid - 1, i + halfW)
+            var sum = 0.0
+            for j in lo...hi { sum += grid[j] }
+            detrended[i] = grid[i] - sum / Double(hi - lo + 1)
+        }
+        if standardDeviation(detrended) <= 1e-9 { return (nan, nan) }   // flat → no RSA
+
+        // Single-window peak-pick → breath intervals → rate = 60/median, rrv = std(intervals). NO clamp.
+        let minDistSamples = max(2, Int((rsaMinPeakDistanceS * rsaResampleHz).rounded()))
+        let peaks = findPeaks(detrended, distance: minDistSamples, height: 0.0)
+        if peaks.count < 3 { return (nan, nan) }
+        var intervals: [Double] = []
+        for i in 1..<peaks.count {
+            let ivS = Double(peaks[i] - peaks[i - 1]) * dt
+            if ivS >= rsaMinBreathIntervalS && ivS <= rsaMaxBreathIntervalS { intervals.append(ivS) }
+        }
+        if intervals.count < 2 { return (nan, nan) }
+        let med = HRVAnalyzer.median(intervals)
+        if med <= 0.0 { return (nan, nan) }
+        return (60.0 / med, standardDeviation(intervals))
+    }
+
     // MARK: - Per-epoch features
 
     struct EpochFeatures {
@@ -1452,10 +1614,18 @@ public enum SleepStager {
         let respRate: Double   // breaths/min
         let rrv: Double        // respiratory-rate variability (s)
         let clock: Double      // normalized time since onset, 0..1
+        /// SESSION-scoped HF (parasympathetic) power (ms²) from `HRVFreqDomain.freqDomain` over the whole
+        /// window's R-R — the SAME value on every epoch of a session, stamped by `extractFeatures` so
+        /// `classifyEpochs` can thread it (with `hfDeepMinPowerMs2`) into the sparse-path deep verdict
+        /// (change 2). NaN when unavailable; defaulted so direct EpochFeatures constructions (tests) omit
+        /// it and stay on the byte-identical dense path. (change 2)
+        var hf: Double = Double.nan
     }
 
     static func extractFeatures(grid: EpochGrid, ckFlags: [Bool], dogHR: [Double],
-                                onsetIdx: Int, finalWakeIdx: Int) -> [EpochFeatures] {
+                                onsetIdx: Int, finalWakeIdx: Int,
+                                respChannelEmpty: Bool = false,
+                                sessionHF: Double = Double.nan) -> [EpochFeatures] {
         let n = grid.nEpochs
         let rescaled = rescaleCounts(grid.counts)
         let halfW = Int((featureWindowS / epochS / 2).rounded())
@@ -1483,7 +1653,17 @@ public enum SleepStager {
 
             var winResp: [Double] = []
             for j in lo..<hi { winResp.append(contentsOf: grid.resp[j]) }
-            let (respRate, rrv) = respRateAndRRV(winResp)
+            var (respRate, rrv) = respRateAndRRV(winResp)
+            // RR-RSA fallback (change 1), SPARSE-GATED on a genuinely EMPTY resp channel: a WHOOP5 RR-only
+            // night has no raw resp ADC, so respRateAndRRV is (nan, nan) and the REM path collapses to its
+            // strict no-resp fallback. Recover a breathing rate + RRV from the window's R-R via RSA so the
+            // classifier regains an irregular-respiration signal. Inert when resp is present (dense WHOOP
+            // 4.0), so those nights are byte-identical.
+            if respChannelEmpty {
+                let (rsaRate, rsaRRV) = rsaRateAndRRV(winRR)
+                if !respRate.isFinite { respRate = rsaRate }
+                if !rrv.isFinite { rrv = rsaRRV }
+            }
 
             let clock = min(1.0, max(0.0, Double(i - onsetIdx) / span))
 
@@ -1492,7 +1672,7 @@ public enum SleepStager {
                 moveFrac: grid.moveFrac[i],
                 ckSleep: i < ckFlags.count ? ckFlags[i] : true,
                 hr: hrMean, hrVar: hrVar, rmssd: rmssd, sdnn: sdnn,
-                respRate: respRate, rrv: rrv, clock: clock))
+                respRate: respRate, rrv: rrv, clock: clock, hf: sessionHF))
         }
         return feats
     }
@@ -1521,11 +1701,16 @@ public enum SleepStager {
         let rrvHi = percentile(sleepFeats.map { $0.rrv }, stageRRVHighPct)
         let rrvLo = percentile(sleepFeats.map { $0.rrv }, stageRRVLowPct)
         let cardiacSparse = isCardiacSparse(sleepFeats)
+        // Session HF power (change 2): the same value on every epoch (stamped by extractFeatures), read
+        // here and threaded with the `hfDeepMinPowerMs2` bar into classifyOne. Used only on the
+        // sparse-cardiac deep path; NaN (freqDomain unavailable) leaves the existing rule in place.
+        let hf = sleepFeats.first?.hf ?? Double.nan
+        let hfBar: Double? = hfDeepMinPowerMs2
 
         return features.map {
             classifyOne($0, hrLo: hrLo, hrHi: hrHi, rmssdHi: rmssdHi,
                         hrvarHi: hrvarHi, rrvHi: rrvHi, rrvLo: rrvLo,
-                        cardiacSparse: cardiacSparse)
+                        cardiacSparse: cardiacSparse, hf: hf, hfBar: hfBar)
         }
     }
 
@@ -1542,18 +1727,31 @@ public enum SleepStager {
 
     static func classifyOne(_ f: EpochFeatures, hrLo: Double?, hrHi: Double?,
                             rmssdHi: Double?, hrvarHi: Double?, rrvHi: Double?, rrvLo: Double?,
-                            cardiacSparse: Bool = false) -> String {
+                            cardiacSparse: Bool = false,
+                            hf: Double = Double.nan, hfBar: Double? = nil) -> String {
         let hasHR = f.hr.isFinite
         let hrLow = hasHR && hrLo != nil && f.hr <= hrLo!
         let hrHigh = hasHR && hrHi != nil && f.hr >= hrHi!
 
-        // NOTE: HF omitted (no neurokit2). Parasympathetic tone = RMSSD only. A MISSING per-epoch
-        // RMSSD (sparse R-R, common on BLE-offloaded nights and especially 5/MG) is treated as
-        // pro-deep rather than deep-blocking — mirroring how a missing respiration value is handled
-        // below — so those nights stop decoding 0 m of deep sleep despite a real depth signature
-        // (still + low HR + regular breathing). An epoch WITH a finite RMSSD must still clear the
-        // high-tone bar. (#127, #129)
-        let parasympOK = (!f.rmssd.isFinite) || (rmssdHi != nil && f.rmssd >= rmssdHi!)
+        // Parasympathetic (pro-deep) tone. Per-epoch: a MISSING RMSSD (sparse R-R, common on BLE-offloaded
+        // nights and especially 5/MG) is treated as pro-deep rather than deep-blocking — mirroring how a
+        // missing respiration value is handled below — so those nights stop decoding 0 m of deep sleep
+        // despite a real depth signature (still + low HR + regular breathing). An epoch WITH a finite RMSSD
+        // must still clear the high-tone bar. (#127, #129)
+        //
+        // SPARSE-cardiac strengthening (change 2): when the session is sparse-cardiac AND this epoch's
+        // per-epoch RMSSD is missing, the blanket pro-deep fallback can't tell deep from light. If we have
+        // a session HF (parasympathetic, 0.15–0.40 Hz) power reading — omitted per-epoch (no neurokit2) but
+        // computable over the whole R-R window — require it to clear `hfBar`: real slow-wave sleep carries
+        // genuine vagal HF power. Gated so it only ever ADDS evidence: inert on the dense path
+        // (cardiacSparse false) and when HF is unavailable (NaN → falls back to the blanket rule), so 4.0
+        // goldens are byte-identical. (change 2, #705 companion)
+        let parasympOK: Bool
+        if cardiacSparse, !f.rmssd.isFinite, hf.isFinite, let hfBar {
+            parasympOK = hf >= hfBar
+        } else {
+            parasympOK = (!f.rmssd.isFinite) || (rmssdHi != nil && f.rmssd >= rmssdHi!)
+        }
 
         let hrvarHigh = f.hrVar.isFinite && hrvarHi != nil && f.hrVar >= hrvarHi!
         let cardiacActivated = hrHigh || hrvarHigh
@@ -1704,12 +1902,18 @@ public enum SleepStager {
     /// from the real classifier. Read-only. (#688)
     static func remRejectReason(_ f: EpochFeatures, hrLo: Double?, hrHi: Double?,
                                 rmssdHi: Double?, hrvarHi: Double?, rrvHi: Double?, rrvLo: Double?,
-                                cardiacSparse: Bool = false) -> REMRejectReason {
-        // Mirror classifyOne's derived predicates exactly.
+                                cardiacSparse: Bool = false,
+                                hf: Double = Double.nan, hfBar: Double? = nil) -> REMRejectReason {
+        // Mirror classifyOne's derived predicates exactly (incl. the change-2 sparse-cardiac HF strengthening).
         let hasHR = f.hr.isFinite
         let hrLow = hasHR && hrLo != nil && f.hr <= hrLo!
         let hrHigh = hasHR && hrHi != nil && f.hr >= hrHi!
-        let parasympOK = (!f.rmssd.isFinite) || (rmssdHi != nil && f.rmssd >= rmssdHi!)
+        let parasympOK: Bool
+        if cardiacSparse, !f.rmssd.isFinite, hf.isFinite, let hfBar {
+            parasympOK = hf >= hfBar
+        } else {
+            parasympOK = (!f.rmssd.isFinite) || (rmssdHi != nil && f.rmssd >= rmssdHi!)
+        }
         let hrvarHigh = f.hrVar.isFinite && hrvarHi != nil && f.hrVar >= hrvarHi!
         let cardiacActivated = hrHigh || hrvarHigh
         let cardiacActivatedForWake = cardiacSparse ? hrHigh : cardiacActivated
@@ -1758,8 +1962,13 @@ public enum SleepStager {
         let ckFlags = coleKripke(rescaled)
         let (onsetIdx, finalWakeIdx) = onsetAndFinalWake(ckFlags)
         let dogHR = dogHRVariability(grid.hr)
+        // Re-run the SAME resp-absent RR-RSA fallback + session HF the real staging seam uses (changes
+        // 1/2), so the diagnostic explains the SAME hypnogram (not a stale pre-change funnel).
+        let respChannelEmpty = respSeg.isEmpty
+        let sessionHF = HRVFreqDomain.freqDomain(rr: rrSeg)?.hf ?? Double.nan
         let feats = extractFeatures(grid: grid, ckFlags: ckFlags, dogHR: dogHR,
-                                    onsetIdx: onsetIdx, finalWakeIdx: finalWakeIdx)
+                                    onsetIdx: onsetIdx, finalWakeIdx: finalWakeIdx,
+                                    respChannelEmpty: respChannelEmpty, sessionHF: sessionHF)
 
         // The SAME session-relative reference percentiles classifyEpochs derives.
         let sleepFeats = feats.contains { $0.ckSleep } ? feats.filter { $0.ckSleep } : feats
@@ -1770,6 +1979,9 @@ public enum SleepStager {
         let rrvHi = percentile(sleepFeats.map { $0.rrv }, stageRRVHighPct)
         let rrvLo = percentile(sleepFeats.map { $0.rrv }, stageRRVLowPct)
         let cardiacSparse = isCardiacSparse(sleepFeats)
+        // Same session HF bar classifyEpochs threads (change 2), so the funnel mirrors the real deep gate.
+        let hf = sleepFeats.first?.hf ?? Double.nan
+        let hfBar: Double? = hfDeepMinPowerMs2
 
         // Classify + post-process exactly as stageSession does, so we explain the SAME hypnogram.
         let labels = classifyEpochs(feats)
@@ -1790,7 +2002,7 @@ public enum SleepStager {
             // Per-epoch REM reason at the raw classifier seam (pre-smoothing) — the funnel's mouth.
             switch remRejectReason(f, hrLo: hrLo, hrHi: hrHi, rmssdHi: rmssdHi,
                                    hrvarHi: hrvarHi, rrvHi: rrvHi, rrvLo: rrvLo,
-                                   cardiacSparse: cardiacSparse) {
+                                   cardiacSparse: cardiacSparse, hf: hf, hfBar: hfBar) {
             case .remEligible:           remAtClassify += 1
             case .wonOtherStage:         wonOtherStage += 1
             case .notStill:              blockedNotStill += 1
