@@ -1,6 +1,7 @@
 import WidgetKit
 import SwiftUI
 import ActivityKit
+import AppIntents
 import StrandDesign
 
 /// Live Activity for an active live-HR session — shown on the Lock Screen and in the Dynamic Island.
@@ -29,6 +30,8 @@ struct NOOPLiveActivity: Widget {
                         bannerStat(label: "Effort", value: "\(e)")
                     }
                 }
+                // Icon-only so the banner keeps fitting both stats on narrow phones.
+                buzzButton(bonded: context.state.bonded, compact: true)
             }
             .padding()
             .activityBackgroundTint(StrandPalette.surfaceBase)
@@ -48,6 +51,14 @@ struct NOOPLiveActivity: Widget {
                         if let e = context.state.effort {
                             statColumn(label: "Effort", value: "\(e)")
                         }
+                    }
+                }
+                DynamicIslandExpandedRegion(.center) {
+                    // Buttons live in the EXPANDED island only — compact/minimal presentations can't
+                    // host interactive controls.
+                    HStack(spacing: 8) {
+                        buzzButton(bonded: context.state.bonded)
+                        markButton()
                     }
                 }
                 DynamicIslandExpandedRegion(.bottom) {
@@ -92,4 +103,35 @@ private func statColumn(label: String, value: String) -> some View {
     }
     .multilineTextAlignment(.center)
     .fixedSize()
+}
+
+/// Buzz button for the banner and expanded island. `BuzzStrapIntent` runs in the widget-extension
+/// process, so it only enqueues via the App Group and its `openAppWhenRun` foregrounds NOOP — BLE is
+/// foreground-only, and the buzz is delivered when the app drains the queue. Disabled while unbonded:
+/// the tap could never land. `compact` drops the text for the space-tight lock-screen banner.
+@ViewBuilder
+private func buzzButton(bonded: Bool, compact: Bool = false) -> some View {
+    Button(intent: BuzzStrapIntent()) {
+        if compact {
+            Image(systemName: "waveform.path")
+        } else {
+            Label("Buzz", systemImage: "waveform.path")
+        }
+    }
+    .buttonStyle(.bordered)
+    .font(.caption2)
+    .tint(StrandPalette.accent)
+    .disabled(!bonded)
+}
+
+/// Mark-a-moment button for the expanded island. Enqueues a timestamped moment silently (no app
+/// open); the app applies it on its next foreground via `drainPendingIntents`.
+@ViewBuilder
+private func markButton() -> some View {
+    Button(intent: MarkMomentIntent()) {
+        Label("Mark", systemImage: "mappin.and.ellipse")
+    }
+    .buttonStyle(.bordered)
+    .font(.caption2)
+    .tint(StrandPalette.accent)
 }

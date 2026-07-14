@@ -2,6 +2,7 @@ import SwiftUI
 import StrandDesign
 import StrandAnalytics
 import WhoopStore
+import StrandImport
 import Foundation
 #if canImport(MapKit)
 import MapKit
@@ -79,6 +80,16 @@ struct WorkoutDetailView: View {
             ToolbarItem(placement: .cancellationAction) {
                 Button("Done") { dismiss() }
             }
+            // Share this session as a .tcx — the per-workout interchange file Strava / intervals.icu
+            // accept. FileExport handles the platform affordance (share sheet on iOS, save panel on Mac).
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    Task { await exportTcx() }
+                } label: {
+                    Label("Export", systemImage: "square.and.arrow.up")
+                }
+                .accessibilityLabel(String(localized: "Export workout as a TCX file"))
+            }
         }
         .task { await load() }
     }
@@ -123,6 +134,29 @@ struct WorkoutDetailView: View {
             self.zonesFromImport = fromImport
             self.loaded = true
         }
+    }
+
+    // MARK: - Export (TCX)
+
+    /// Share this session as a TCX file built from the row's summary + the window's RAW HR samples
+    /// (not the chart's 5-min buckets — consumers want the real trace). HR-only trackpoints: the
+    /// stored route polyline has no per-point timestamps, so distance/calories ride in the Lap
+    /// summary. The read cap is generous (~16h at 1 Hz is ~58k samples); an HR-empty window still
+    /// exports a valid summary-only file.
+    @MainActor
+    private func exportTcx() async {
+        let hr = await repo.hrSamples(from: row.startTs, to: row.endTs, limit: 200_000)
+        let xml = TcxExporter.tcx(row, hr: hr)
+        FileExport.exportText(
+            xml, suggestedName: FileExport.timestampedName("noop-\(sportSlug(row.sport))", ext: "tcx"))
+    }
+
+    /// Filename slug for the sport: lowercased, each non-alphanumeric run collapsed to one "-",
+    /// trimmed ("Trail Run" → "trail-run"). Degenerate input falls back to a neutral "workout".
+    private func sportSlug(_ raw: String) -> String {
+        let dashed = raw.lowercased().map { $0.isLetter || $0.isNumber ? String($0) : "-" }.joined()
+        let collapsed = dashed.split(separator: "-").joined(separator: "-")
+        return collapsed.isEmpty ? "workout" : collapsed
     }
 
     // MARK: - Header

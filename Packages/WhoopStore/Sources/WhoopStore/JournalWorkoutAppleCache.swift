@@ -220,6 +220,27 @@ extension WhoopStore {
         }
     }
 
+    /// Workouts with startTs in [from, to], oldest first, with NO row cap. The HealthKit workout
+    /// write-back reads bounded day windows (a handful of rows), where the capped overload above
+    /// would silently truncate a legitimate window if callers picked the limit wrong.
+    public func workouts(deviceId: String, from: Int, to: Int) async throws -> [WorkoutRow] {
+        try syncRead { db in
+            try Row.fetchAll(db, sql: """
+                SELECT startTs, endTs, sport, source, durationS, energyKcal, avgHr, maxHr,
+                       strain, distanceM, zonesJSON, notes FROM workout
+                WHERE deviceId = ? AND startTs >= ? AND startTs <= ?
+                ORDER BY startTs ASC
+                """, arguments: [deviceId, from, to])
+                .map {
+                    WorkoutRow(startTs: $0["startTs"], endTs: $0["endTs"], sport: $0["sport"],
+                               source: $0["source"], durationS: $0["durationS"],
+                               energyKcal: $0["energyKcal"], avgHr: $0["avgHr"], maxHr: $0["maxHr"],
+                               strain: $0["strain"], distanceM: $0["distanceM"],
+                               zonesJSON: $0["zonesJSON"], notes: $0["notes"])
+                }
+        }
+    }
+
     /// Apple-Health daily aggregates for days in [from, to] (lexicographic compare), oldest first.
     public func appleDaily(deviceId: String, from: String, to: String) async throws -> [AppleDaily] {
         try syncRead { db in

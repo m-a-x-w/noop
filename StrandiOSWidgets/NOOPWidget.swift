@@ -1,5 +1,6 @@
 import WidgetKit
 import SwiftUI
+import AppIntents
 import StrandDesign
 
 /// Timeline entry backed by the latest `WidgetSnapshot` the app published into the App Group.
@@ -96,34 +97,45 @@ struct NOOPWidgetView: View {
     }
 
     private var home: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("NOOP").font(.system(size: 13, weight: .bold))
-                    .foregroundStyle(StrandPalette.textSecondary)
-                Spacer()
-                Circle().fill(snap.bonded ? StrandPalette.statusPositive : StrandPalette.statusCritical)
-                    .frame(width: 8, height: 8)
-            }
-            Spacer(minLength: 0)
-            HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(snap.recovery.map(String.init) ?? "–")
-                    .font(.system(size: 40, weight: .bold, design: .rounded))
-                    .foregroundStyle(recoveryColor)
-                Text("%").font(.headline).foregroundStyle(StrandPalette.textTertiary)
-            }
-            Text("Charge").font(.caption).foregroundStyle(StrandPalette.textTertiary)
-            Spacer(minLength: 0)
-            HStack {
-                Label("\(snap.bpm.map(String.init) ?? "–")", systemImage: "waveform.path.ecg")
-                // Medium has room for one more stat (#446); small stays a clean Charge + HR + battery.
-                if family == .systemMedium {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("NOOP").font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(StrandPalette.textSecondary)
                     Spacer()
-                    Label("\(snap.effort.map(String.init) ?? "–")", systemImage: "bolt.fill")
+                    Circle().fill(snap.bonded ? StrandPalette.statusPositive : StrandPalette.statusCritical)
+                        .frame(width: 8, height: 8)
                 }
-                Spacer()
-                Label("\(snap.batteryPct.map { "\($0)%" } ?? "–")", systemImage: "battery.50")
+                Spacer(minLength: 0)
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
+                    Text(snap.recovery.map(String.init) ?? "–")
+                        .font(.system(size: 40, weight: .bold, design: .rounded))
+                        .foregroundStyle(recoveryColor)
+                    Text("%").font(.headline).foregroundStyle(StrandPalette.textTertiary)
+                }
+                Text("Charge").font(.caption).foregroundStyle(StrandPalette.textTertiary)
+                Spacer(minLength: 0)
+                HStack {
+                    Label("\(snap.bpm.map(String.init) ?? "–")", systemImage: "waveform.path.ecg")
+                    // Medium has room for one more stat (#446); small stays a clean Charge + HR + battery.
+                    if family == .systemMedium {
+                        Spacer()
+                        Label("\(snap.effort.map(String.init) ?? "–")", systemImage: "bolt.fill")
+                    }
+                    Spacer()
+                    Label("\(snap.batteryPct.map { "\($0)%" } ?? "–")", systemImage: "battery.50")
+                }
+                .font(.caption2).foregroundStyle(StrandPalette.textSecondary)
             }
-            .font(.caption2).foregroundStyle(StrandPalette.textSecondary)
+            // The action pair rides medium's trailing edge, which is otherwise dead width — the stats
+            // column costs nothing vertically there. Small stays read-only: a button row would squeeze
+            // the Charge headline out of its square.
+            if family == .systemMedium {
+                VStack(alignment: .leading, spacing: 6) {
+                    buzzButton
+                    markButton
+                }
+            }
         }
         .padding(12)
     }
@@ -161,8 +173,40 @@ struct NOOPWidgetView: View {
                 statCell("Battery", value: snap.batteryPct.map { "\($0)%" })
             }
             Spacer(minLength: 0)
+            HStack(spacing: 8) {
+                buzzButton
+                markButton
+            }
         }
         .padding(16)
+    }
+
+    // MARK: - Interactive actions
+
+    // System families only — interactive controls don't render in accessory* families, so the
+    // Lock-Screen builders above stay button-free. The intents run in THIS widget-extension process
+    // and only enqueue via PendingIntents (App Group); the app drains on its next foreground.
+
+    /// Buzz fires `BuzzStrapIntent`, whose `openAppWhenRun` foregrounds NOOP — BLE is foreground-only,
+    /// so the haptic can't be delivered from here. Disabled while unbonded: the tap could never land.
+    private var buzzButton: some View {
+        Button(intent: BuzzStrapIntent()) {
+            Label("Buzz", systemImage: "waveform.path")
+        }
+        .buttonStyle(.bordered)
+        .font(.caption2)
+        .tint(StrandPalette.accent)
+        .disabled(!snap.bonded)
+    }
+
+    /// Mark enqueues a timestamped moment silently (no app open); it's applied on next foreground.
+    private var markButton: some View {
+        Button(intent: MarkMomentIntent()) {
+            Label("Mark", systemImage: "mappin.and.ellipse")
+        }
+        .buttonStyle(.bordered)
+        .font(.caption2)
+        .tint(StrandPalette.accent)
     }
 
     /// One labelled stat in the large grid — value over a caption, equal-width so the three columns align.
