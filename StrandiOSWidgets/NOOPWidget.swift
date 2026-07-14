@@ -66,6 +66,29 @@ struct NOOPWidgetView: View {
         return StrandPalette.recoveryColor(Double(r))
     }
 
+    /// Battery glyph banded to the level (mirrors DevicesView.batterySymbol), not a constant half-full
+    /// icon. Unknown → the neutral half glyph, matching the "–" text.
+    private func batterySymbol(_ pct: Int?) -> String {
+        switch pct ?? -1 {
+        case ..<0:  return "battery.50"
+        case ..<13: return "battery.0"
+        case ..<38: return "battery.25"
+        case ..<63: return "battery.50"
+        case ..<88: return "battery.75"
+        default:    return "battery.100"
+        }
+    }
+
+    /// Tint the battery readout only when it's low, so a nearly-dead strap actually reads as a warning
+    /// at a glance (same thresholds as the Today ring); normal levels keep each site's base colour.
+    private func batteryTint(_ pct: Int?, normal: Color) -> Color {
+        switch pct ?? 100 {
+        case ..<15: return StrandPalette.statusCritical
+        case ..<35: return StrandPalette.statusWarning
+        default:    return normal
+        }
+    }
+
     private var inlineText: String {
         var parts: [String] = []
         if let r = snap.recovery { parts.append("Charge \(r)%") }
@@ -123,7 +146,8 @@ struct NOOPWidgetView: View {
                         Label("\(snap.effort.map(String.init) ?? "–")", systemImage: "bolt.fill")
                     }
                     Spacer()
-                    Label("\(snap.batteryPct.map { "\($0)%" } ?? "–")", systemImage: "battery.50")
+                    Label("\(snap.batteryPct.map { "\($0)%" } ?? "–")", systemImage: batterySymbol(snap.batteryPct))
+                        .foregroundStyle(batteryTint(snap.batteryPct, normal: StrandPalette.textSecondary))
                 }
                 .font(.caption2).foregroundStyle(StrandPalette.textSecondary)
             }
@@ -170,7 +194,8 @@ struct NOOPWidgetView: View {
             HStack(alignment: .top, spacing: 0) {
                 statCell("Rest HR", value: snap.restingHr.map { "\($0)" }, unit: "bpm")
                 statCell("HR", value: snap.bpm.map { "\($0)" }, unit: "bpm")
-                statCell("Battery", value: snap.batteryPct.map { "\($0)%" })
+                statCell("Battery", value: snap.batteryPct.map { "\($0)%" },
+                         tint: batteryTint(snap.batteryPct, normal: StrandPalette.textPrimary))
             }
             Spacer(minLength: 0)
             HStack(spacing: 8) {

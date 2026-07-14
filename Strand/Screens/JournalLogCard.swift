@@ -212,6 +212,7 @@ struct JournalLogCard: View {
     }
 
     private func commitNumeric(_ q: String, value: Double) {
+        StrandHaptic.commit.play()   // confirm a logged value, like the yes/no pills
         Task {
             await repo.saveJournalNumeric(day: dayKey, question: q, value: value)
             onChanged()
@@ -338,6 +339,10 @@ struct JournalLogCard: View {
     private func answerPill(_ label: LocalizedStringKey, q: String, value: Bool) -> some View {
         let selected = answers[q] == value
         return pillButton(label, selected: selected) {
+            // Instant tactile ack so logging a behaviour confirms like the Sleep mark and segmented
+            // pills do — .commit on a save, .selection on the tri-state clear. Fires synchronously,
+            // ahead of the async DB write, so the feel isn't gated on the reload landing.
+            (selected ? StrandHaptic.selection : StrandHaptic.commit).play()
             Task {
                 // Tri-state: re-tapping the filled chip clears the answer (natural-key delete,
                 // scoped to "noop-journal", imported rows can never be removed this way).

@@ -91,6 +91,9 @@ struct RootTabView: View {
                 // Re-tapping the active tab refreshes that page's data (2026-07-02).
                 Task { await repo.refresh() }
             })
+            // Cap Dynamic Type for the compact nav pill: its @ScaledMetric icon/label sizes still grow
+            // for low vision, but the accessibility sizes would overflow the fixed-height bar.
+            .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
         }
         .task {
             await repo.refresh()
@@ -538,6 +541,12 @@ private struct FloatingTabBar: View {
     /// Fires when the user taps the ALREADY-active tab (2026-07-02: re-tap should refresh).
     var onReselect: (Int) -> Void = { _ in }
 
+    // Scale the icon + label with Dynamic Type (a bare `.system(size:)` is frozen). The label VStack
+    // is capped at `.xxxLarge` below so the compact pill still grows for low vision without the
+    // accessibility sizes exploding the fixed-height bar.
+    @ScaledMetric private var iconSize: CGFloat = 18
+    @ScaledMetric private var labelSize: CGFloat = 10
+
     private struct Item: Identifiable { let title: LocalizedStringKey; let icon: String; let tag: Int; var id: Int { tag } }
     private let nav = [Item(title: "Today", icon: "square.grid.2x2", tag: 0),
                        Item(title: "Trends", icon: "chart.line.uptrend.xyaxis", tag: 1),
@@ -580,14 +589,17 @@ private struct FloatingTabBar: View {
             if active {
                 onReselect(item.tag)
             } else {
+                // Match the segmented-pill / range-picker feel (Components.swift) — the primary nav
+                // control shouldn't be the one silent tap in the app.
+                StrandHaptic.selection.play()
                 withAnimation(.timingCurve(0.22, 1, 0.36, 1, duration: 0.24)) { selection = item.tag }
             }
         } label: {
             VStack(spacing: 3) {
                 Image(systemName: item.icon)
-                    .font(.system(size: 18, weight: active ? .semibold : .regular))
+                    .font(.system(size: iconSize, weight: active ? .semibold : .regular))
                 Text(item.title)
-                    .font(.system(size: 10, weight: active ? .semibold : .medium))
+                    .font(.system(size: labelSize, weight: active ? .semibold : .medium))
             }
             .foregroundStyle(active ? StrandPalette.accent : StrandPalette.textSecondary)
             .frame(maxWidth: .infinity)

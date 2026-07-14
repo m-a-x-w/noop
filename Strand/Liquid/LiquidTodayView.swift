@@ -1269,7 +1269,10 @@ private struct LiquidBatteryButton: View {
             ZStack {
                 Circle().fill(Color(.sRGB, red: 10 / 255, green: 11 / 255, blue: 16 / 255, opacity: 0.5))
                 Circle().strokeBorder(.white.opacity(0.15), lineWidth: 1)
-                if let pct = live.batteryPct {
+                // Gate on `connected`: on disconnect BLEManager leaves batteryPct set, so an ungated
+                // ring keeps showing an hours-old level as if live. The sibling LiquidStrapBatteryRow
+                // already gates the same way; fall through to the bolt.slash empty state instead.
+                if live.connected, let pct = live.batteryPct {
                     Circle()
                         .trim(from: 0, to: max(0.02, min(1, pct / 100)))
                         .stroke(ringColor(pct), style: StrokeStyle(lineWidth: 3, lineCap: .round))
@@ -1298,7 +1301,8 @@ private struct LiquidBatteryButton: View {
         .accessibilityLabel(batteryAccessibility)
     }
     private var batteryAccessibility: String {
-        let base = live.batteryPct.map { "Strap battery \(Int($0.rounded())) percent" } ?? "Strap battery"
+        guard live.connected, let pct = live.batteryPct else { return "Strap battery, disconnected" }
+        let base = "Strap battery \(Int(pct.rounded())) percent"
         return live.charging == true ? base + ", charging" : base
     }
     private func ringColor(_ p: Double) -> Color {

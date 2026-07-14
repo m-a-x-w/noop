@@ -1738,7 +1738,7 @@ final class AppModel: ObservableObject {
                 } else { span = "" }
                 finishImport(.whoop, summary: "Imported \(summary.recordCount) records\(span)")
             } catch {
-                finishImport(.whoop, summary: "Import failed: \(error)", failed: true)
+                finishImport(.whoop, summary: "Import failed: \(error.localizedDescription)", failed: true)
             }
         }
     }
@@ -1771,7 +1771,7 @@ final class AppModel: ObservableObject {
                 let sleeps = summary.countsByCategory["sleepSessions"] ?? 0
                 finishImport(.xiaomi, summary: "Imported \(days) days · \(sleeps) sleeps\(span)")
             } catch {
-                finishImport(.xiaomi, summary: "Import failed: \(error)", failed: true)
+                finishImport(.xiaomi, summary: "Import failed: \(error.localizedDescription)", failed: true)
             }
         }
     }
@@ -1805,7 +1805,7 @@ final class AppModel: ObservableObject {
                 repo.appleHealthLoadedSeq = -1
                 finishImport(.appleHealth, summary: "Imported \(summary.recordCount) records")
             } catch {
-                finishImport(.appleHealth, summary: "Import failed: \(error)", failed: true)
+                finishImport(.appleHealth, summary: "Import failed: \(error.localizedDescription)", failed: true)
             }
         }
     }
