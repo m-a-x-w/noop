@@ -13,6 +13,13 @@ struct RootTabView: View {
 
     /// Which quick-action screen the centre FAB is presenting (nil = sheet closed).
     @State private var quickAction: QuickAction?
+    /// When the quick-action MENU is up, the destination the user picked is PUSHED onto this path
+    /// inside the same sheet — so picking Live/Workout/Journal/Breathe slides in rather than dismissing
+    /// and re-presenting a second sheet (the old 50ms bounce flickered on the primary action path).
+    @State private var quickPath: [QuickAction] = []
+    /// The menu sheet's detent: compact for the picker, `.large` once a full screen is pushed so it
+    /// isn't clipped. Reset to compact when the path empties (back to the menu) or the sheet closes.
+    @State private var quickDetent: PresentationDetent = .height(344)
     /// Presents the Devices manager (pair / switch bands) when a screen asks the shell to open it.
     @State private var showDevices = false
     /// A routed v5 pillar screen (Insights hub / Lab Book / fused record / Rhythm) presented as a sheet
@@ -90,6 +97,9 @@ struct RootTabView: View {
             FloatingTabBar(selection: $selectedTab, onReselect: { _ in
                 // Re-tapping the active tab refreshes that page's data (2026-07-02).
                 Task { await repo.refresh() }
+            }, onAdd: {
+                // Open the quick-action menu from anywhere — the bar is always on screen.
+                withAnimation(Self.sheetEase) { quickAction = .menu }
             })
             // Cap Dynamic Type for the compact nav pill: its @ScaledMetric icon/label sizes still grow
             // for low vision, but the accessibility sizes would overflow the fixed-height bar.
@@ -107,7 +117,7 @@ struct RootTabView: View {
         // Quick-action sheet presents with the calm easing (~0.42s) per the README sheet spec —
         // the easing is applied where `quickAction` is set (see `presentQuickAction`), keeping the
         // animation scoped to the sheet rather than the whole shell.
-        .sheet(item: $quickAction) { action in
+        .sheet(item: $quickAction, onDismiss: { quickPath = []; quickDetent = .height(344) }) { action in
             quickActionDestination(action)
         }
         // Live's "Manage devices" affordance (and any future cross-screen link to Devices) routes here:
@@ -203,16 +213,19 @@ struct RootTabView: View {
     private func quickActionDestination(_ action: QuickAction) -> some View {
         switch action {
         case .menu:
-            QuickActionSheet { picked in
-                // Swap the menu for the chosen destination on the next runloop so the sheet
-                // re-presents cleanly (avoids dismiss/re-present races). Calm easing on re-present.
-                quickAction = nil
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                    withAnimation(Self.sheetEase) { quickAction = picked }
-                }
+            // The menu is the root of its own nav stack; picking an action PUSHES that screen in place
+            // (a slide), instead of dismissing the sheet and re-presenting a second one. The detent
+            // grows to `.large` on push so the full screen has room, and shrinks back at the menu.
+            NavigationStack(path: $quickPath) {
+                QuickActionSheet { picked in quickPath = [picked] }
+                    .toolbar(.hidden, for: .navigationBar)
+                    .navigationDestination(for: QuickAction.self) { quickTarget($0) }
             }
-            .presentationDetents([.height(344)])
+            .presentationDetents([.height(344), .large], selection: $quickDetent)
             .presentationDragIndicator(.hidden)
+            .onChange(of: quickPath) { _, path in
+                withAnimation(Self.sheetEase) { quickDetent = path.isEmpty ? .height(344) : .large }
+            }
         case .live:
             quickScreen(LiveView())
         case .workout:
@@ -221,6 +234,31 @@ struct RootTabView: View {
             quickScreen(InsightsView())
         case .breathe:
             quickScreen(BreathingView())
+        }
+    }
+
+    /// A quick-action destination PUSHED inside the menu's nav stack (so it has no NavigationStack of
+    /// its own — the menu provides it). Gets the shared surface + a Done that closes the whole sheet;
+    /// the automatic back button returns to the picker so the user can choose another action.
+    @ViewBuilder
+    private func quickTarget(_ action: QuickAction) -> some View {
+        Group {
+            switch action {
+            case .live: LiveView()
+            case .workout: WorkoutsView()
+            case .journal: InsightsView()
+            case .breathe: BreathingView()
+            case .menu: EmptyView()   // never pushed; keeps the switch exhaustive
+            }
+        }
+        .background(StrandPalette.surfaceBase.ignoresSafeArea())
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(StrandPalette.surfaceBase, for: .navigationBar)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button("Done") { quickAction = nil }
+                    .foregroundStyle(StrandPalette.accent)
+            }
         }
     }
 
@@ -473,23 +511,28 @@ private struct QuickActionSheet: View {
                 .padding(.top, 10)
                 .padding(.bottom, 14)
 
-            Text("QUICK ACTIONS")
-                .font(StrandFont.overline)
-                .tracking(1.6)
-                .foregroundStyle(StrandPalette.textTertiary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 16)
-                .padding(.bottom, 10)
+            // Scrollable so every action stays reachable when Larger Text pushes the rows past the
+            // compact detent height (they used to clip with no way to scroll to them).
+            ScrollView {
+                VStack(spacing: 0) {
+                    Text("QUICK ACTIONS")
+                        .font(StrandFont.overline)
+                        .tracking(1.6)
+                        .foregroundStyle(StrandPalette.textTertiary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 10)
 
-            VStack(spacing: 8) {
-                row("Live HR", icon: "waveform.path.ecg", tint: StrandPalette.metricRose) { onPick(.live) }
-                row("Start workout", icon: "figure.run", tint: StrandPalette.effortColor) { onPick(.workout) }
-                row("Log journal", icon: "square.and.pencil", tint: StrandPalette.accent) { onPick(.journal) }
-                row("Breathe", icon: "wind", tint: StrandPalette.restColor) { onPick(.breathe) }
+                    VStack(spacing: 8) {
+                        row("Live HR", icon: "waveform.path.ecg", tint: StrandPalette.metricRose) { onPick(.live) }
+                        row("Start workout", icon: "figure.run", tint: StrandPalette.effortColor) { onPick(.workout) }
+                        row("Log journal", icon: "square.and.pencil", tint: StrandPalette.accent) { onPick(.journal) }
+                        row("Breathe", icon: "wind", tint: StrandPalette.restColor) { onPick(.breathe) }
+                    }
+                    .padding(.horizontal, 16)
+                }
             }
-            .padding(.horizontal, 16)
-
-            Spacer(minLength: 0)
+            .scrollBounceBehavior(.basedOnSize)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(
@@ -540,6 +583,9 @@ private struct FloatingTabBar: View {
     @Binding var selection: Int
     /// Fires when the user taps the ALREADY-active tab (2026-07-02: re-tap should refresh).
     var onReselect: (Int) -> Void = { _ in }
+    /// Opens the quick-action menu. Lives on the always-visible bar so Live HR / journal / workout /
+    /// breathe are reachable from EVERY tab — the header "+" only ever existed on Today.
+    var onAdd: () -> Void = {}
 
     // Scale the icon + label with Dynamic Type (a bare `.system(size:)` is frozen). The label VStack
     // is capped at `.xxxLarge` below so the compact pill still grows for low vision without the
@@ -561,6 +607,7 @@ private struct FloatingTabBar: View {
             tabButton(nav[1])
             tabButton(nav[2])
             tabButton(nav[3])
+            addButton
         }
         .padding(.vertical, 7)
         .padding(.horizontal, 8)
@@ -581,6 +628,24 @@ private struct FloatingTabBar: View {
         .shadow(color: .black.opacity(0.22), radius: 18, x: 0, y: 8)
         .padding(.horizontal, 22)
         .padding(.bottom, 4)
+    }
+
+    /// The gold quick-action "+" pinned to the trailing end of the bar — a fixed-width circle so the
+    /// four tabs keep their even spacing. Available on every tab (the header "+" was Today-only).
+    private var addButton: some View {
+        Button {
+            StrandHaptic.selection.play()
+            onAdd()
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(StrandPalette.surfaceBase)
+                .frame(width: 34, height: 34)
+                .background(Circle().fill(StrandPalette.accent))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Quick actions")
+        .padding(.leading, 2)
     }
 
     private func tabButton(_ item: Item) -> some View {
