@@ -416,6 +416,22 @@ struct MetricDetailView: View {
         metric.format(v, system: unitSystem, temperature: temperatureUnit, effortScale: effortScale)
     }
 
+    /// The skin-temp trend chart re-scales to the display unit ONLY under a °F preference; every other
+    /// metric (and °C) plots in its stored unit, so the chart is byte-identical for them. TrendChart's
+    /// Y axis draws the RAW plotted value (`AxisValueLabel()`), unlike the tooltip/readout which route
+    /// through `fmt` — so without this the axis would show °C ticks while the readout shows °F. Convert
+    /// the whole series so axis, line, tooltip and readout all agree.
+    private var convertsSkinTempChart: Bool {
+        metric.key == "skin_temp" && temperatureUnit == .fahrenheit
+    }
+    /// Convert a stored-°C skin-temp series to °F, deciding the kind ONCE (from the latest value) so a
+    /// mixed absolute/deviation history can't flip mid-axis: absolute uses ×9/5+32, a ±deviation ×9/5.
+    private func skinTempToFahrenheit(_ windowed: [(day: String, value: Double)]) -> [(day: String, value: Double)] {
+        let absolute = windowed.last.map { VitalBands.isAbsoluteSkinTemp($0.value) } ?? true
+        return windowed.map { (day: $0.day,
+                               value: absolute ? UnitFormatter.celsiusToFahrenheit($0.value) : $0.value * 9.0 / 5.0) }
+    }
+
     @State private var range: ExploreRange = .month
     /// Draw-in fraction for the hero ring gauge (0–100 scores). Set to the real fraction
     /// in `.onAppear` with a soft ease, exactly as TodayView animates its rings.
@@ -792,13 +808,17 @@ struct MetricDetailView: View {
             trailing: "\(heroValue) · \(asOf)",
             tint: metricDomain(metric).color
         ) {
+            let chartWindowed = convertsSkinTempChart ? skinTempToFahrenheit(windowed) : windowed
+            let tempLabel = UnitFormatter.temperatureUnit(temperatureUnit)
             TrendChart(
-                points: trendPoints(windowed),
+                points: trendPoints(chartWindowed),
                 gradient: metricGradient(metric),
-                valueRange: valueRange(windowed.map(\.value)),
+                valueRange: valueRange(chartWindowed.map(\.value)),
                 showsArea: true,
                 height: NoopMetrics.chartHeight,
-                valueFormat: { fmt($0) }
+                // Points are pre-converted for skin-temp/°F, so the axis + tooltip must format the
+                // ALREADY-converted value (no second conversion); every other metric keeps `fmt`.
+                valueFormat: convertsSkinTempChart ? { String(format: "%.1f ", $0) + tempLabel } : { fmt($0) }
             )
         } footer: {
             ChartFooter([
