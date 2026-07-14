@@ -1,5 +1,6 @@
 import SwiftUI
 import StrandDesign
+import StrandAnalytics
 import WhoopStore
 
 // MARK: - Deep Timeline (full-day, full-resolution metric viewer) — #575
@@ -53,6 +54,16 @@ struct FullDayChartView: View {
     @State private var loading = true
     /// Bumped on every settled zoom/metric change so the re-read task re-runs at the new resolution.
     @State private var reloadTick = 0
+
+    // Skin temp is STORED in °C but must render in the user's temperature preference (#103). Only the
+    // skin-temp track converts here — every other timeline metric is unit-agnostic. Read the two keys the
+    // standard way and resolve the effective unit (same idiom as MetricExplorerView / VitalSignsSummary).
+    @AppStorage(UnitPrefs.systemKey) private var unitSystemRaw = UnitSystem.metric.rawValue
+    @AppStorage(UnitPrefs.temperatureKey) private var temperatureRaw = ""
+    private var temperatureUnit: TemperatureUnit {
+        let system = UnitSystem(rawValue: unitSystemRaw) ?? .metric
+        return UnitPrefs.resolveTemperature(system: system, override: temperatureRaw)
+    }
 
     /// The full clamp the zoom window can never escape — the selected calendar day.
     private var dayBounds: ClosedRange<Date> {
@@ -201,7 +212,7 @@ struct FullDayChartView: View {
 
     private var chart: some View {
         OverviewHRChart(
-            points: series.points,
+            points: displayPoints,
             // #979 spin-off — the same sleep-band + workout-glyph layers the classic Today feeds. Passed
             // on EVERY metric track (they're time annotations, so "when was I asleep / training" reads
             // against skin temp or HRV just as it does against HR); the glyph anchors at the shown
@@ -209,7 +220,7 @@ struct FullDayChartView: View {
             sleep: sleepSpan,
             workouts: workoutSpans,
             gradient: gradientFor(metric),
-            valueRange: valueRange(series.points),
+            valueRange: valueRange(displayPoints),
             xRange: dayBounds,
             height: 280,
             // #979 spin-off — iPhone touch scrub: hold to pin the crosshair, drag to read values under
@@ -290,7 +301,8 @@ struct FullDayChartView: View {
     }
 
     private var statsFooter: some View {
-        let v = series.points.map(\.value)
+        // Min/Avg/Max off the DISPLAY series so the footer numbers match the plotted line + readout.
+        let v = displayPoints.map(\.value)
         return ChartFooter([
             ("Min", format(v.min() ?? 0)),
             ("Avg", format(v.reduce(0, +) / Double(max(1, v.count)))),
@@ -371,14 +383,41 @@ struct FullDayChartView: View {
                       : String(localized: "\(series.bucketSeconds)-second average")
     }
 
+    // MARK: Skin-temp display conversion (#103)
+
+    /// Skin temp is BIMODAL: a CSV-imported ABSOLUTE °C vs the on-device ±°C DEVIATION. Decide the kind
+    /// ONCE from a representative (latest) point so the axis, plotted line, footer and readout all convert
+    /// with the SAME rule — mixing them would make the axis and readout disagree. (Mirrors VitalSignsSummary.)
+    private var skinTempIsAbsolute: Bool {
+        guard let v = series.points.last?.value else { return true }
+        return VitalBands.isAbsoluteSkinTemp(v)
+    }
+
+    /// A stored °C skin-temp value mapped to the display unit's NUMBER (no label). An absolute reading uses
+    /// the full C→F formula (×9/5 + 32); a ±deviation scales by 9/5 with NO offset. Identity under °C.
+    private func skinTempDisplayValue(_ c: Double) -> Double {
+        guard temperatureUnit == .fahrenheit else { return c }
+        return skinTempIsAbsolute ? UnitFormatter.celsiusToFahrenheit(c) : c * 9.0 / 5.0
+    }
+
+    /// The plotted series in DISPLAY units. Only skin temp converts, and only under a °F preference; every
+    /// other metric (and °C) passes through untouched, so those tracks are byte-identical to before. The
+    /// whole chart — axis (via `valueRange`), marks, footer and crosshair readout — reads from THIS one
+    /// series, so the axis and the readouts can never disagree.
+    private var displayPoints: [TrendPoint] {
+        guard metric == .skinTemp, temperatureUnit == .fahrenheit else { return series.points }
+        return series.points.map { TrendPoint(date: $0.date, value: skinTempDisplayValue($0.value)) }
+    }
+
     private var latestReadout: String? {
-        series.points.last.map { "\(format($0.value))\(unitSuffix)" }
+        displayPoints.last.map { "\(format($0.value))\(unitSuffix)" }
     }
 
     private var unitSuffix: String {
         switch metric {
         case .hr: return " bpm"
-        case .skinTemp: return "°C"
+        // Follows the °C/°F preference — the resolved label matches the converted `displayPoints` value.
+        case .skinTemp: return UnitFormatter.temperatureUnit(temperatureUnit)
         case .respiration: return ""
         case .hrv: return " ms"
         case .spo2, .motion, .bandSleepState: return ""
@@ -388,6 +427,7 @@ struct FullDayChartView: View {
     private func format(_ v: Double) -> String {
         switch metric {
         case .hr, .respiration, .hrv: return String(Int(v.rounded()))
+        // `v` is already in the display unit (see `displayPoints`); just render the number.
         case .skinTemp: return String(format: "%.1f", v)
         case .spo2, .motion: return String(format: "%.2f", v)
         // #175: name the band's own state at the nearest code so the readout reads "asleep", not "2.0".

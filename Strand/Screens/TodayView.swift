@@ -194,9 +194,14 @@ struct TodayView: View {
     /// The "update ringer", the bell in the top bar opens this inbox; dismissed Today cards post into it.
     @EnvironmentObject var updateStore: UpdateStore
 
-    // Imperial/Metric display preference (D#103). Only the Weight tile carries a convertible unit here.
+    // Imperial/Metric display preference (D#103). The Weight tile and the Skin-Temp deviation tile carry
+    // convertible units here; the skin-temp override resolves via the temperature key below.
     @AppStorage(UnitPrefs.systemKey) private var unitSystemRaw = UnitSystem.metric.rawValue
+    @AppStorage(UnitPrefs.temperatureKey) private var temperatureRaw = ""
     private var unitSystem: UnitSystem { UnitSystem(rawValue: unitSystemRaw) ?? .metric }
+    private var temperatureUnit: TemperatureUnit {
+        UnitPrefs.resolveTemperature(system: unitSystem, override: temperatureRaw)
+    }
     // Day-cycle scene backdrop (#698). Default ON. When the user turns it off in Settings → Appearance,
     // Today drops the SceneScreenBackground and falls back to the plain dark surfaceBase canvas. The
     // cards already sit on an opaque canvas, so readability is unchanged either way.
@@ -2152,8 +2157,12 @@ struct TodayView: View {
         case .bloodOxygen:
             return d?.spo2Pct.map { String(format: "%.0f%%", $0) } ?? "—"
         case .skinTemp:
-            // Stored as a deviation from baseline (°C); show it signed so +/- reads honestly.
-            return d?.skinTempDevC.map { String(format: "%+.1f°", $0) } ?? "—"
+            // Stored as a ±°C DEVIATION from baseline. Convert onto the user's temperature preference via
+            // the delta formatter (×9/5, NO +32 offset — it's a difference), keeping the leading +/- sign.
+            return d?.skinTempDevC.map { dev in
+                let formatted = UnitFormatter.temperatureDeltaFromCelsius(dev, unit: temperatureUnit, decimals: 1)
+                return dev >= 0 ? "+\(formatted)" : formatted
+            } ?? "—"
         case .sleep:
             return sleepValue(d)
         case .steps:

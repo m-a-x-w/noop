@@ -1,4 +1,5 @@
 import Foundation
+import StrandAnalytics
 
 /// One interrogable metric: how to fetch it (key+source), how to label/format it, and whether
 /// higher is better (drives delta tinting). The Metric Explorer + Compare are built from this list.
@@ -55,7 +56,14 @@ struct MetricDescriptor: Identifiable, Hashable {
                 effortScale: EffortScale = .hundred) -> String {
         switch unit {
         case "kg":  return UnitFormatter.massFromKilograms(v, system: system)
-        case "°C":  return UnitFormatter.temperatureFromCelsius(v, unit: temperature, decimals: decimals)
+        case "°C":
+            // skin_temp is BIMODAL: CSV imports store an ABSOLUTE °C, the on-device pipeline a ±°C
+            // DEVIATION (Repository.dailyColumn maps "skin_temp" → skinTempDevC). An absolute reading
+            // uses the full C→F formula (×9/5 + 32); a ±deviation must scale WITHOUT the +32 offset, else
+            // a delta gets an absolute offset applied (garbage °F). Mirrors VitalSignsSummary's split.
+            return VitalBands.isAbsoluteSkinTemp(v)
+                ? UnitFormatter.temperatureFromCelsius(v, unit: temperature, decimals: decimals)
+                : UnitFormatter.temperatureDeltaFromCelsius(v, unit: temperature, decimals: decimals)
         default:    return isEffort ? format(v, effortScale: effortScale) : format(v)
         }
     }

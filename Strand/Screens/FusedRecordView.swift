@@ -202,6 +202,15 @@ private struct FusedMetricRowView: View {
     let showProvenance: Bool
     let onCompare: () -> Void
 
+    // Skin-temp values are stored °C; render them on the user's temperature preference (#103). Every
+    // other fused metric is unit-agnostic, so `FusionFormat.value` defaults to °C when this is passed.
+    @AppStorage(UnitPrefs.systemKey) private var unitSystemRaw = UnitSystem.metric.rawValue
+    @AppStorage(UnitPrefs.temperatureKey) private var temperatureRaw = ""
+    private var temperatureUnit: TemperatureUnit {
+        let system = UnitSystem(rawValue: unitSystemRaw) ?? .metric
+        return UnitPrefs.resolveTemperature(system: system, override: temperatureRaw)
+    }
+
     private var point: FusedMetricPoint { row.point }
 
     private var accent: Color {
@@ -217,7 +226,7 @@ private struct FusedMetricRowView: View {
                     .font(StrandFont.headline)
                     .foregroundStyle(StrandPalette.textPrimary)
                 Spacer(minLength: 8)
-                Text(FusionFormat.value(point.value, metricKey: point.metric))
+                Text(FusionFormat.value(point.value, metricKey: point.metric, temperature: temperatureUnit))
                     .font(StrandFont.number(20))
                     .foregroundStyle(accent)
                     .lineLimit(1)
@@ -268,7 +277,7 @@ private struct FusedMetricRowView: View {
 
         case .agree:
             if let other = point.contributors.dropFirst().first {
-                Text("\(other.source.displayName) agrees: \(FusionFormat.value(other.value, metricKey: point.metric))")
+                Text("\(other.source.displayName) agrees: \(FusionFormat.value(other.value, metricKey: point.metric, temperature: temperatureUnit))")
                     .font(StrandFont.footnote)
                     .foregroundStyle(StrandPalette.textTertiary)
             }
@@ -277,7 +286,7 @@ private struct FusedMetricRowView: View {
             if let other = point.contributors.dropFirst().first {
                 HStack(spacing: 6) {
                     StatePill("Differs slightly", tone: .neutral, showsDot: false)
-                    Text("\(other.source.displayName): \(FusionFormat.value(other.value, metricKey: point.metric))")
+                    Text("\(other.source.displayName): \(FusionFormat.value(other.value, metricKey: point.metric, temperature: temperatureUnit))")
                         .font(StrandFont.footnote)
                         .foregroundStyle(StrandPalette.textSecondary)
                     Spacer(minLength: 0)
@@ -306,7 +315,7 @@ private struct FusedMetricRowView: View {
     /// "Apple Health says 6h 40m. Tap to compare" style line for a conflict.
     private var conflictSummary: String {
         guard let other = point.contributors.dropFirst().first else { return String(localized: "Tap to compare") }
-        return String(localized: "\(other.source.displayName) says \(FusionFormat.value(other.value, metricKey: point.metric)). Tap to compare")
+        return String(localized: "\(other.source.displayName) says \(FusionFormat.value(other.value, metricKey: point.metric, temperature: temperatureUnit)). Tap to compare")
     }
 }
 
@@ -369,6 +378,14 @@ private struct ContributorRow: View {
     let metricKey: String
     let isWinner: Bool
 
+    // Skin-temp values are stored °C; render them on the user's temperature preference (#103).
+    @AppStorage(UnitPrefs.systemKey) private var unitSystemRaw = UnitSystem.metric.rawValue
+    @AppStorage(UnitPrefs.temperatureKey) private var temperatureRaw = ""
+    private var temperatureUnit: TemperatureUnit {
+        let system = UnitSystem(rawValue: unitSystemRaw) ?? .metric
+        return UnitPrefs.resolveTemperature(system: system, override: temperatureRaw)
+    }
+
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
@@ -384,7 +401,7 @@ private struct ContributorRow: View {
                     .foregroundStyle(StrandPalette.textTertiary)
             }
             Spacer(minLength: 8)
-            Text(FusionFormat.value(contrib.value, metricKey: metricKey))
+            Text(FusionFormat.value(contrib.value, metricKey: metricKey, temperature: temperatureUnit))
                 .font(StrandFont.number(18))
                 .foregroundStyle(isWinner ? StrandPalette.textPrimary : StrandPalette.textSecondary)
                 .lineLimit(1)
@@ -394,8 +411,8 @@ private struct ContributorRow: View {
         .accessibilityElement(children: .combine)
         // Whole-string key per variant (never a concatenated localized tail on an a11y label).
         .accessibilityLabel(isWinner
-            ? "\(contrib.source.displayName), \(FusionFormat.value(contrib.value, metricKey: metricKey)), in use"
-            : "\(contrib.source.displayName), \(FusionFormat.value(contrib.value, metricKey: metricKey))")
+            ? "\(contrib.source.displayName), \(FusionFormat.value(contrib.value, metricKey: metricKey, temperature: temperatureUnit)), in use"
+            : "\(contrib.source.displayName), \(FusionFormat.value(contrib.value, metricKey: metricKey, temperature: temperatureUnit))")
     }
 }
 
@@ -405,7 +422,9 @@ private struct ContributorRow: View {
 /// screen: the engine deals in numbers, the UI owns units. Sleep/duration keys read as "7h 12m";
 /// temp as "34.1°C"; HR/HRV/steps as plain integers with the right unit.
 enum FusionFormat {
-    static func value(_ v: Double, metricKey: String) -> String {
+    /// `temperature` routes only the skin-temp key (stored °C) onto the user's °C/°F preference; it
+    /// defaults to `.celsius` so every non-temperature caller is byte-identical and can omit it.
+    static func value(_ v: Double, metricKey: String, temperature: TemperatureUnit = .celsius) -> String {
         switch MetricArbitrationPolicy.kind(forKey: metricKey) {
         case .restingHR, .heartRate:
             return "\(Int(v.rounded())) bpm"
@@ -414,7 +433,11 @@ enum FusionFormat {
         case .spo2:
             return "\(Int(v.rounded()))%"
         case .skinTemp:
-            return String(format: "%.1f°C", v)
+            // Skin temp is BIMODAL: a CSV-imported ABSOLUTE °C (×9/5 + 32) vs an on-device ±°C DEVIATION
+            // (×9/5, no offset). Pick the formatter by the value's kind — mirrors VitalSignsSummary.
+            return VitalBands.isAbsoluteSkinTemp(v)
+                ? UnitFormatter.temperatureFromCelsius(v, unit: temperature, decimals: 1)
+                : UnitFormatter.temperatureDeltaFromCelsius(v, unit: temperature, decimals: 1)
         case .steps:
             return integerGrouped(v)
         case .sleep:
