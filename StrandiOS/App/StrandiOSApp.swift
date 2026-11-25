@@ -45,6 +45,10 @@ struct StrandiOSApp: App {
         // target's BGTaskSchedulerPermittedIdentifiers (project.yml). Without this the overnight drop
         // never fires; the macOS timer, foreground catch-up, and "Run now" already work without it.
         ScheduledDebugExport.register()
+        // v2 UI (NOOP 10): register the bundled 0xProto Nerd Font Mono faces with the process's
+        // font manager BEFORE any view renders, so `Font.custom` in the v2 design system resolves
+        // them. Idempotent + no-op in v1, so it's safe to run unconditionally at launch.
+        V2Font.registerFonts()
         let model = AppModel()
         _model = StateObject(wrappedValue: model)
         _health = StateObject(wrappedValue: HealthKitBridge(
@@ -183,7 +187,22 @@ private struct iOSRootView: View {
     @AppStorage("noop.onboarded") private var onboarded = false
     @AppStorage("noop.lastSeenChangelogVersion") private var lastSeenChangelog = ""
     @AppStorage("noop.acceptedTermsVersion") private var acceptedTerms = ""
+    /// v2 UI rework (NOOP 10). Now the DEFAULT shell. The legacy v1 `RootTabView` remains behind the
+    /// flag as a one-release escape hatch (turn `noop.uiV2Enabled` off, or launch with `--ui-v1`); a later
+    /// cleanup pass removes it once v2 has soaked. `--ui-v2` still forces v2 in DEBUG for the screenshot loop.
+    @AppStorage("noop.uiV2Enabled") private var uiV2Enabled = true
     @State private var showWhatsNew = false
+
+    /// Resolves which shell to show. In DEBUG, `--ui-v2` / `--ui-v1` launch arguments force the choice
+    /// (for the screenshot/verification loop) and win over the stored preference; in Release the stored
+    /// `noop.uiV2Enabled` toggle decides.
+    private var useV2Shell: Bool {
+        #if DEBUG
+        if CommandLine.arguments.contains("--ui-v2") { return true }
+        if CommandLine.arguments.contains("--ui-v1") { return false }
+        #endif
+        return uiV2Enabled
+    }
 
     var body: some View {
         #if DEBUG
@@ -205,9 +224,17 @@ private struct iOSRootView: View {
         return AnyView(shell)
     }
 
+    @ViewBuilder private var activeShell: some View {
+        if useV2Shell {
+            V2RootView()
+        } else {
+            RootTabView()
+        }
+    }
+
     private var shell: some View {
         ZStack {
-            RootTabView()
+            activeShell
             if !onboarded && !demoBypass {
                 OnboardingWizard(onFinished: {
                     onboarded = true

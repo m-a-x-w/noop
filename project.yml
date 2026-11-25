@@ -11,11 +11,13 @@ options:
   developmentLanguage: en
 settings:
   base:
-    MARKETING_VERSION: "8.4.0"
+    # NOOP 10 — the v2 "max" UI rework rebrands the marketing version to 10.0.0. CFBundleVersion stays
+    # monotonic (172 → 173) so sideload/AltStore over-install is unambiguous regardless of the marketing jump.
+    MARKETING_VERSION: "10.0.0"
     # iOS build number (CFBundleVersion). GLOBAL so the iOS app AND its widget extension inherit the
     # SAME value — they must match or iOS warns "extension version must match parent app" (#416).
     # macOS sets its own CFBundleVersion on the Strand target and is unaffected by this.
-    CURRENT_PROJECT_VERSION: "172"
+    CURRENT_PROJECT_VERSION: "173"
     SWIFT_VERSION: "5.0"
     # Emit localizable strings so Xcode auto-extracts every LocalizedStringKey into the
     # String Catalog on build (the English (US) base entries).
@@ -269,11 +271,11 @@ targets:
       - package: MarkdownUI
       - package: ZIPFoundation
       - target: NOOPiOSWidgets
-      # Embed the watchOS app so the iPhone app carries it (NOOP.app/Watch/NOOPWatch.app). A watch app
-      # installs by riding inside its iOS companion; without this it would never reach a paired watch.
-      # Build-from-source delivers it for certain; sideload install of the embedded watch app under a free
-      # Apple ID is unproven (an Apple limitation), so the docs steer watch users to a source build for now.
-      - target: NOOPWatch
+      # v2 / NOOP 10 is iPhone-only. The watchOS app is intentionally NOT embedded: embedding NOOPWatch
+      # forced every `xcodebuild -scheme NOOPiOS` to also build the watch app, which needs a watchOS
+      # simulator runtime installed. The NOOPWatch / NOOPWatchComplications targets still exist in this
+      # file (compile-verifiable via `-scheme NOOPWatch` if a runtime is installed) but the iPhone app no
+      # longer carries them.
 
   # WidgetKit + Live Activity extension — the iOS analogue of the macOS menu-bar
   # extra. Reads a tiny snapshot the app publishes into the shared App Group.

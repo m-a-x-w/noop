@@ -45,6 +45,18 @@ own Charge/Rest, and **never** reads or displays Oura's encrypted readiness or s
 documented Oura file-import lane (`Packages/StrandImport/Sources/StrandImport/OuraExportParser.swift`)
 remains available as a fallback.
 
+## Typeface — 0xProto Nerd Font Mono
+- **0xProto** (`0xType/0xProto`), in its **Nerd Fonts** patched build
+  (`ryanoasis/nerd-fonts`), is bundled as the app's UI face for the v2 (NOOP 10) redesign:
+  all data, labels, titles, and gauge numerals render in **0xProto Nerd Font Mono**. The
+  Regular, Bold, and Italic TTFs ship inside the `StrandDesign` package
+  (`Packages/StrandDesign/Sources/StrandDesign/Resources/Fonts/`) and are registered with the
+  process font manager at runtime (`V2Font.registerFonts()`).
+  Licensed under the **SIL Open Font License, Version 1.1**. The full license text ships with
+  the fonts at
+  `Packages/StrandDesign/Sources/StrandDesign/Resources/Fonts/0xProto-LICENSE.txt`.
+  Copyright (c) 2023, 0xType Project Authors (https://github.com/0xType).
+
 ## Other
 - **GRDB.swift** (`groue/GRDB.swift`) — SQLite persistence (via Swift Package Manager).
 - **MarkdownUI** (`gonzalezreal/swift-markdown-ui`) — renders the AI Coach's Markdown
